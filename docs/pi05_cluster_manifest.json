@@ -1,0 +1,432 @@
+{
+  "audit_date": "2026-09-10",
+  "source_workspace": "/home/jwang3617/pipette",
+  "scope": "pi05 pipette migration; revisions precede documentation-only handoff commits",
+  "repositories": [
+    {
+      "name": "VLA-Precision",
+      "role": "modified for native JAX pi05 SFT/preview",
+      "implementation_revision": "f5126a7d3e4a6905ed3a0571a887aa8e5982fda8",
+      "branch": "jy-vla-precision",
+      "remotes": [
+        "fork\thttps://github.com/G1NO3/VLA-Precision.git (fetch)",
+        "fork\thttps://github.com/G1NO3/VLA-Precision.git (push)",
+        "origin\thttps://github.com/scy-v/VLA-Precision.git (fetch)",
+        "origin\thttps://github.com/scy-v/VLA-Precision.git (push)"
+      ],
+      "unrelated_worktree_status": [],
+      "migration_clone_url": "https://github.com/G1NO3/VLA-Precision.git"
+    },
+    {
+      "name": "VLAPolicyBridge",
+      "role": "modified for pi05 GUI preview",
+      "implementation_revision": "43f4b1939e76715113b403b42d96222b01ee2170",
+      "branch": "jy-vla-precision",
+      "remotes": [
+        "origin\thttps://github.com/birbirll/VLAPolicyBridge.git (fetch)",
+        "origin\thttps://github.com/birbirll/VLAPolicyBridge.git (push)"
+      ],
+      "unrelated_worktree_status": [],
+      "migration_clone_url": "https://github.com/birbirll/VLAPolicyBridge.git"
+    },
+    {
+      "name": "TWIST2",
+      "role": "read-only FK/URDF dependency",
+      "implementation_revision": "6acb9d25917283f577789803a5824185317c20b5",
+      "branch": "hil_control",
+      "remotes": [
+        "origin\thttps://github.com/MLeggiero/TWIST2.git (fetch)",
+        "origin\thttps://github.com/MLeggiero/TWIST2.git (push)",
+        "personal\thttps://github.com/G1NO3/TWIST2.git (fetch)",
+        "personal\thttps://github.com/G1NO3/TWIST2.git (push)",
+        "upstream\thttps://github.com/zhigenzhao/TWIST2.git (fetch)",
+        "upstream\thttps://github.com/zhigenzhao/TWIST2.git (push)"
+      ],
+      "unrelated_worktree_status": [],
+      "migration_clone_url": "https://github.com/G1NO3/TWIST2.git",
+      "migration_branch_remote": "personal"
+    },
+    {
+      "name": "starVLA",
+      "role": "interface inspected; no pi05 modifications",
+      "implementation_revision": "65a13bb00b75f3b1d3f2dab5e92a824c04b6b22f",
+      "branch": "jy-pipette-tube-gr00t",
+      "remotes": [
+        "origin\thttps://github.com/LidarDexManip/starVLA.git (fetch)",
+        "origin\thttps://github.com/LidarDexManip/starVLA.git (push)",
+        "upstream\thttps://github.com/starVLA/starVLA.git (fetch)",
+        "upstream\thttps://github.com/starVLA/starVLA.git (push)"
+      ],
+      "unrelated_worktree_status": []
+    },
+    {
+      "name": "RFT",
+      "role": "outside this pi05 effort; preserve unrelated untracked scripts",
+      "implementation_revision": "bc8c81237f1133d70f6a83f790507374f054ef74",
+      "branch": "jy",
+      "remotes": [
+        "origin\thttps://github.com/HenryZh007/RFT.git (fetch)",
+        "origin\thttps://github.com/HenryZh007/RFT.git (push)"
+      ],
+      "unrelated_worktree_status": [
+        "?? vega_wuji_isaac6/scripts/pipette_tube_press/build_pipette_phase_subset.py",
+        "?? vega_wuji_isaac6/scripts/pipette_tube_press/relabel_pipette_tube_phases.py"
+      ]
+    },
+    {
+      "name": "IsaacLab-3.0",
+      "role": "outside this pi05 effort",
+      "implementation_revision": "d7824157a82b8466f6b24e85892754007ce2daab",
+      "branch": "release/3.0.0-beta2",
+      "remotes": [
+        "origin\thttps://github.com/isaac-sim/IsaacLab.git (fetch)",
+        "origin\thttps://github.com/isaac-sim/IsaacLab.git (push)"
+      ],
+      "unrelated_worktree_status": []
+    },
+    {
+      "name": "g1_redball_eval",
+      "role": "outside this pi05 effort; preserve unrelated untracked files",
+      "implementation_revision": "02fddc3fa8c0b2b6abcee5a27f7c26fdfdfd1ecb",
+      "branch": "oldisaac51",
+      "remotes": [
+        "origin\thttps://github.com/LidarDexManip/g1_redball_eval.git (fetch)",
+        "origin\thttps://github.com/LidarDexManip/g1_redball_eval.git (push)"
+      ],
+      "unrelated_worktree_status": [
+        "?? isaac6/"
+      ]
+    },
+    {
+      "name": "unitree_sim_isaaclab",
+      "role": "outside this pi05 effort; preserve unrelated simulation work",
+      "implementation_revision": "e30c25b1dffdf92ada1d6c8c1fe9a47bdde0fecc",
+      "branch": "main",
+      "remotes": [
+        "origin\thttps://github.com/unitreerobotics/unitree_sim_isaaclab.git (fetch)",
+        "origin\thttps://github.com/unitreerobotics/unitree_sim_isaaclab.git (push)"
+      ],
+      "unrelated_worktree_status": [
+        "M tasks/g1_tasks/__init__.py",
+        " M tasks/g1_tasks/pick_place_cylinder_g1_29dof_inspire/pickplace_cylinder_g1_29dof_inspire_env_cfg.py",
+        " M tasks/utils/__pycache__/__init__.cpython-311.pyc",
+        " M tasks/utils/__pycache__/importer.cpython-311.pyc",
+        " M tasks/utils/__pycache__/parse_cfg.cpython-311.pyc",
+        "?? smoke_render.py",
+        "?? tasks/common_scene/base_scene_pickplace_pistoncfg.py",
+        "?? tasks/common_scene/base_scene_pickplace_redball.py",
+        "?? tasks/common_scene/external_mesh_object.py",
+        "?? tasks/common_scene/holeplate_object.py",
+        "?? tasks/common_scene/pipette_stand_object.py",
+        "?? tasks/common_scene/piston_object.py",
+        "?? tasks/common_scene/pot_object.py",
+        "?? tasks/g1_tasks/pick_place_piston_g1_29dof_inspire/",
+        "?? tasks/g1_tasks/pick_place_redball_g1_29dof_inspire/",
+        "?? view_redball.py"
+      ]
+    }
+  ],
+  "dependencies": {
+    "openpi": "2d70d966582e711128ad8358d8dbf23d2cc3d658",
+    "lerobot": "d6ea3bbce0fc8c75138f02639ac4ceaf12a67829",
+    "agentlace": "cf2c337c5e3694cdbfc14831b239bd657bc4894d"
+  },
+  "published_checkpoint": {
+    "repo_id": "GeertWang/pi05-pipette-lora-bc-20260909",
+    "revision": "f09e444ffb651fb72bb559b34c57005fe115fd97",
+    "path_in_snapshot": "checkpoints/999",
+    "public": true,
+    "bytes": 9524680531,
+    "verified_files": 51
+  },
+  "dataset": {
+    "repo_id": "jren313/g1-pipette-3view-hgdagger-20260904",
+    "revision": "e74439f3eb2257661145571571b2dfaa5592f734",
+    "prepared_cache": "datasets/g1-pipette-pi05-30hz-e74439f3eb22",
+    "expert_labels": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions",
+    "training_episodes": 37,
+    "validation_episodes": [
+      9,
+      10,
+      12,
+      18,
+      21,
+      23,
+      28,
+      29,
+      33
+    ],
+    "train_chunks": 21141,
+    "validation_chunks": 5521
+  },
+  "critical_file_checksums": [
+    {
+      "path": "datasets/g1-pipette-pi05-30hz-e74439f3eb22/manifest.json",
+      "bytes": 89069,
+      "sha256": "0c1be2cdb0f9ec8d7ea04523de3b043666e12d7a608ca8366b0b718d83d700b2"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/RECONSTRUCTION.json",
+      "bytes": 16892,
+      "sha256": "555e989b860142bf4aa0c2db83d1e57d599a3ce69afea56e1a40ea75c15d1f83"
+    },
+    {
+      "path": "TWIST2/assets/g1/g1_29dof_rev_1_0.urdf",
+      "bytes": 36227,
+      "sha256": "824ce02c2c1e489aa8dece47a10fe02d1872289c0e6d01ba51abd291e66b7b2c"
+    },
+    {
+      "path": "VLAPolicyBridge/scripts/dataset/prepare_pipette_hil_candidates.py",
+      "bytes": 29865,
+      "sha256": "d7ae137b39c547f4939fc06e51dd0e8e50bbccb7a4e329bc78d597410a55ad66"
+    },
+    {
+      "path": "VLA-Precision/assets/pi05_lora_finetune_pipette/local/g1-pipette-pi05-30hz/norm_stats.json",
+      "bytes": 4394,
+      "sha256": "c8126474b74a5a0218f3f8d8afebc6d1435d8074808260504715fdf7e2a7c29b"
+    },
+    {
+      "path": "models/openpi/big_vision/paligemma_tokenizer.model",
+      "bytes": 4264023,
+      "sha256": "8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000000.parquet",
+      "bytes": 40492,
+      "sha256": "7e760c18bf5123e9353aadc82b75a6799f6d8329aa7b8804dd95c2b9c03b441b"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000001.parquet",
+      "bytes": 48417,
+      "sha256": "fedbebf31d23f6bfcf5a493b4e3ea40385d06dff2f81e166474e7c433b727548"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000002.parquet",
+      "bytes": 27633,
+      "sha256": "f9ec30e8e9ee68409cb3e2883e312bf8fdc2d5097694c987ab6ffce0721ff29b"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000003.parquet",
+      "bytes": 34891,
+      "sha256": "29e9fe8a08b06066cdf5bf6212bfb44782429eb9ca36851dc7b46ad7367cef64"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000004.parquet",
+      "bytes": 18591,
+      "sha256": "041590fa8cc22603c6b3eb64207adb97dae4d30a9b02e6657b3d1812088dff62"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000005.parquet",
+      "bytes": 34937,
+      "sha256": "8d67977e8333df0d25b2dbc2689f4a3dbae96d512423779bebae5425743e9bd1"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000006.parquet",
+      "bytes": 41146,
+      "sha256": "0d063a5c49779e79a8296f40fe36e5209c386cef9e1034e9376cd59523a440e2"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000007.parquet",
+      "bytes": 38457,
+      "sha256": "2b8a12519ad0b8ec7063d19b195d6beb633b7e7db426ea9b4d6e50c373862ff0"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000008.parquet",
+      "bytes": 34292,
+      "sha256": "02f0a4418b06e09f1f1211e824dce80718bbb208a9d06f53fd5e769ddba45537"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000009.parquet",
+      "bytes": 62495,
+      "sha256": "da054f2782ee68728cb3264a7ed2d86bd07ecec393b81b1fa940d419fc30251c"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000010.parquet",
+      "bytes": 36555,
+      "sha256": "8def01b96ec2bf1fe2c1a5f99f937d6a73e93a284f4002b726d49a15922974f8"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000011.parquet",
+      "bytes": 27187,
+      "sha256": "1119229567573435385f31baf6dfa5a574d1fbf5641d29a2436158c71d2dc262"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000012.parquet",
+      "bytes": 53929,
+      "sha256": "68615f7bf602198a3e785d850f456ef8680948d8cf1bad4f531ae0ad68cc2956"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000013.parquet",
+      "bytes": 43308,
+      "sha256": "5b59f8d51b20871e9f9942d532b67860af409c71c53afd53f0a7de4b4188a334"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000014.parquet",
+      "bytes": 41223,
+      "sha256": "9227d6391840eb78d2f8a22d6948f6c78d26bdb5bbe77b1af3ac6a392634f279"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000015.parquet",
+      "bytes": 27527,
+      "sha256": "19fca08b2e6a092904b70b1cb9f1001cc7f4ecf01f7fbd3566563daf83ec9cbb"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000016.parquet",
+      "bytes": 32495,
+      "sha256": "85f198da856cda030a28f8b90edbe536832043bb6c6514528088bc07240e99ed"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000017.parquet",
+      "bytes": 33152,
+      "sha256": "c5624a9b83867e0b127005689f4c796b3f93acf1f02834f98f8a8044f2144093"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000018.parquet",
+      "bytes": 40340,
+      "sha256": "9b032a096245d563494d1c022c190a6876f6bbac4adb9f97419fc6a6949d42bb"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000019.parquet",
+      "bytes": 36240,
+      "sha256": "5b7bab9ff2b21dcc0330f0c4e44975a73993aa93cb5b8bbb589cf865beed30db"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000020.parquet",
+      "bytes": 34177,
+      "sha256": "a6bf188854336544fce5ed279e013e00113b7453f124e242393a333ef655dcc1"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000021.parquet",
+      "bytes": 25247,
+      "sha256": "a399d4f9a46b2922e769bc0f13f9b878cce75f91b2926a7d3e868ffab2feb9cd"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000022.parquet",
+      "bytes": 45903,
+      "sha256": "1e50b4135d83ee746b40c05a968898b9a00d007fa8c7a06979645faf55fa43cc"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000023.parquet",
+      "bytes": 28428,
+      "sha256": "7538590a0e2f0808478bab56c8a17a79e9e68905729f00123aeeb9f27b5cdf83"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000024.parquet",
+      "bytes": 45786,
+      "sha256": "a8ce8c9f1781c2c550232e94d6c0163a645cd82bd362ac1dfba8f694ebf5204e"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000025.parquet",
+      "bytes": 25596,
+      "sha256": "a9355950b4dee28fa1d22c8135d6327ff4a89864cb4d726c771b748fb92d303f"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000026.parquet",
+      "bytes": 34694,
+      "sha256": "c110da48a312bc4f5d0f3b65d549fe88cd8b19eec8222d15c4e4484555d41ea5"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000027.parquet",
+      "bytes": 34836,
+      "sha256": "d12338f068eeecbd86caaa6ce5ae24a17c8f38ae0246ed95ee4f283c9077e805"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000028.parquet",
+      "bytes": 31574,
+      "sha256": "39e9af89e1098f3c6aef8ab5cb7e8710f317b423978cc7b826aa6334e51ce931"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000029.parquet",
+      "bytes": 50013,
+      "sha256": "510e0e39a141f22f5241ddcc308a455593699d34f6be3ab11dbb1911c23956a6"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000030.parquet",
+      "bytes": 49329,
+      "sha256": "7bb29eb6dfbb1a52e1801b97a66d56765b189d3825180ad02534d6f138f8be64"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000031.parquet",
+      "bytes": 34467,
+      "sha256": "1ff95c4c0477f901966f7611042e2a6671892032e078f0a4a75d59ace0b1792f"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000032.parquet",
+      "bytes": 37178,
+      "sha256": "91ac8ef3c1c17d215621b151aee1c96ffa94af62fed0635cc4b4ec1ad14221ac"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000033.parquet",
+      "bytes": 26304,
+      "sha256": "78509593d5a33dc541242d5f1d7d57ac0fdd2df61b7aaf1cad303e66bdd27014"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000034.parquet",
+      "bytes": 31621,
+      "sha256": "7edd6c4d9ddf1ed6d4930341ff47d08cf69bd7434ace4e6898eab340acafc57d"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000035.parquet",
+      "bytes": 36215,
+      "sha256": "e02088c41af360011df27ac58d6bc1f0318b98358b8fdf0e8a5c35b79fc0fbaf"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000036.parquet",
+      "bytes": 40157,
+      "sha256": "c1bc4ca2edc3b01d8490c295a4b715e0911d6813449dfafcdd1892e4af840784"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000037.parquet",
+      "bytes": 36072,
+      "sha256": "a29a83ea7c871a922660390edf3c2e98793c4a651fbc387d3482cad7a82005ae"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000038.parquet",
+      "bytes": 46580,
+      "sha256": "5412cb2a93acbdf2089890821ccbe0d8d035f91c519938b62fb210a42c21e96a"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000039.parquet",
+      "bytes": 35628,
+      "sha256": "0391ba34a5f200182765f351289582d02cdb9fdaea71f299e4a8b2996b9d415d"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000040.parquet",
+      "bytes": 65616,
+      "sha256": "b527814bbac70fe5891b5b8f0d26aa77ca8d0fd8093576b786db8aa5c9c015fb"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000041.parquet",
+      "bytes": 54175,
+      "sha256": "ec56b9c15d5c43477627b35d2ea98823af260323f1edee5d6a41c937794ec69d"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000042.parquet",
+      "bytes": 26896,
+      "sha256": "d2ae6f563008b4cfe6204666f45fadf38417fd778ea8159b1bd2af105e440e85"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000043.parquet",
+      "bytes": 31437,
+      "sha256": "256178e1aa5210458b1421556e940bf002228077e11063e12bc22df10fd32f2a"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000044.parquet",
+      "bytes": 34463,
+      "sha256": "16e69c69120de0eb6dc4f2fcbbb55018f81543f47fbebc52476fdfb1034b5d48"
+    },
+    {
+      "path": "datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/episode_000045.parquet",
+      "bytes": 49972,
+      "sha256": "344ac97d4a8fd4692460f3f95563b81b457f94cd250dc5cb96b042a4b068bc41"
+    }
+  ],
+  "not_yet_validated": [
+    "multi-GPU training",
+    "multi-node training",
+    "full-parameter SFT optimizer update",
+    "real-robot pi05 execution",
+    "ACoB integration",
+    "all-5521-chunk validation"
+  ]
+}

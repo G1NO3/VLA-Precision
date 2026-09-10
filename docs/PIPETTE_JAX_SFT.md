@@ -1,5 +1,8 @@
 # Native JAX π0.5 pipette SFT
 
+For the current cross-repository status, migration steps and larger-GPU plan,
+read [PI05_CLUSTER_HANDOFF.md](PI05_CLUSTER_HANDOFF.md).
+
 Prepared on 2026-09-09. Native Orbax checkpoint loading and held-out inference
 passed. Full-parameter training exceeds the local GPU memory budget. After the
 user resumed work, a separate native JAX LoRA pilot was launched in tmux;

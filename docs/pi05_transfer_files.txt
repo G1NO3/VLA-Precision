@@ -1,0 +1,9 @@
+datasets/g1-pipette-pi05-30hz-e74439f3eb22/
+datasets/g1-pipette-3view-hgdagger-20260904-e74439f3eb22/
+datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/actions/
+datasets/g1-pipette-3view-hgdagger-20260904-expert-xyz-30hz/RECONSTRUCTION.json
+models/openpi/big_vision/paligemma_tokenizer.model
+outputs/pi05-sft-20260909/
+outputs/pi05-lora-sft-20260909/
+outputs/pi05-gui-preview/
+outputs/hf-pi05-pipette-upload.json
