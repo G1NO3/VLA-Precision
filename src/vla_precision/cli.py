@@ -58,7 +58,7 @@ def _command_parser() -> argparse.ArgumentParser:
 
     train = commands.add_parser("train", help="Run Stage I or Stage II training.")
     train_commands = train.add_subparsers(dest="train_command", required=True)
-    train_vla = train_commands.add_parser("vla", help="Stage I OpenPI full-parameter fine-tuning.")
+    train_vla = train_commands.add_parser("vla", help="Stage I OpenPI full-parameter or LoRA fine-tuning.")
     _add_config_arguments(train_vla, allow_deployment=False)
     train_acob = train_commands.add_parser("acob", help="Stage II ACoB online post-training.")
     _add_config_arguments(train_acob)

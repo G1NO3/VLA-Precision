@@ -24,6 +24,7 @@ from vla_precision.integrations.openpi.data_configs import (
     LeRobotDualUR5eDataConfig,
     LeRobotFrankaDataConfig,
     LeRobotUR5eDataConfig,
+    PipetteDataConfig,
     make_robot_data_config_template,
 )
 
@@ -42,6 +43,31 @@ _ACTION_EXPERT_ONLY_FREEZE_FILTER = nnx.Not(
 # Adding a robot/config means adding a DataConfigFactory and one
 # explicit TrainConfig here; no secondary stage/model/platform profile exists.
 _CONFIGS = [
+    openpi_config.TrainConfig(
+        name="pi05_lora_finetune_pipette",
+        model=pi0_config.Pi0Config(
+            pi05=True, discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=PipetteDataConfig(repo_id=""),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # Native OpenPI LoRA recipe: freeze non-LoRA LLM weights; the vision
+        # encoder and small action/time projections remain trainable.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    openpi_config.TrainConfig(
+        name="pi05_full_finetune_pipette",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True),
+        data=PipetteDataConfig(repo_id=""),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+    ),
     openpi_config.TrainConfig(
         name="pi0_full_finetune_ur5e",
         model=pi0_config.Pi0Config(),
@@ -214,8 +240,8 @@ def _stage2_base_configs(
 
 def build_stage1_train_config(config: Stage1Config) -> openpi_config.TrainConfig:
     base = get_config(config.openpi.name)
-    if "_full_finetune_" not in base.name:
-        raise ValueError(f"Stage-I config must be a full-finetune config, got {base.name!r}")
+    if not any(kind in base.name for kind in ("_full_finetune_", "_lora_finetune_")):
+        raise ValueError(f"Stage-I config must be an SFT config, got {base.name!r}")
     model = dataclasses.replace(
         base.model,
         action_dim=config.openpi.model.action_dim,

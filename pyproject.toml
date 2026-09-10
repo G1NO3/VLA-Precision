@@ -35,6 +35,9 @@ stage1 = [
     "polars>=1.30.0",
     "pytest>=8.3.4",
     "tqdm>=4.60.0",
+    # CUDA 12.8 wheels support the local Blackwell (sm_120) GPU.
+    "torch==2.7.1",
+    "torchvision==0.22.1",
 ]
 stage2 = [
     { include-group = "stage1" },
@@ -82,7 +85,14 @@ override-dependencies = [
     "tensorstore==0.1.74",
 ]
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 agentlace = { git = "https://github.com/youliangtan/agentlace.git", rev = "cf2c337c5e3694cdbfc14831b239bd657bc4894d" }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "d6ea3bbce0fc8c75138f02639ac4ceaf12a67829" }
 openpi = { git = "https://github.com/Physical-Intelligence/openpi.git", rev = "2d70d966582e711128ad8358d8dbf23d2cc3d658" }

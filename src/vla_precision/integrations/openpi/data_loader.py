@@ -101,6 +101,13 @@ def create_torch_dataset(
             model_config,
         )
 
+    from vla_precision.data.pipette import PipetteDataset
+    root = source_lerobot_root(root_config)
+    if (root / "manifest.json").is_file():
+        if root_config.data.state_indices or root_config.data.action_indices:
+            raise ValueError("Prepared pipette data already has the final state/action layout")
+        return PipetteDataset(root, action_horizon)
+
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
     root = source_lerobot_root(root_config)
@@ -159,12 +166,14 @@ def create_data_loader(
         / experiment_name
         / "metadata.json"
     )
-    metadata = materialize_lerobot_indices(
-        _lerobot_dataset(dataset),
-        root_config.data,
-        metadata_path=metadata_path,
-    )
-    logger.info("materialized OpenPI training columns: schema_sha256=%s", metadata.schema_sha256)
+    from vla_precision.data.pipette import PipetteDataset
+    if not isinstance(dataset, PipetteDataset):
+        metadata = materialize_lerobot_indices(
+            _lerobot_dataset(dataset),
+            root_config.data,
+            metadata_path=metadata_path,
+        )
+        logger.info("materialized OpenPI training columns: schema_sha256=%s", metadata.schema_sha256)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     local_batch_size = train_config.batch_size // jax.process_count()

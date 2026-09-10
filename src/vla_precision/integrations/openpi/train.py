@@ -5,6 +5,7 @@ install_lerobot_import_compat()
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -197,7 +198,7 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update("jax_compilation_cache_dir", os.environ.get("JAX_COMPILATION_CACHE_DIR", str(epath.Path("~/.cache/jax").expanduser())))
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -283,6 +284,6 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
 
 
 def run_stage1_training(resolved: ResolvedStage1Config) -> None:
-    """Run standard OpenPI full-parameter training from the unified config."""
+    """Run native OpenPI full-parameter or LoRA SFT from the unified config."""
     train_config = build_stage1_train_config(resolved.config)
     _train(train_config, resolved)

@@ -1,6 +1,7 @@
 .venv/
 .pytest_cache/
-/tests/
+/tests/*
+!/tests/test_pipette_preview.py
 .ruff_cache/
 __pycache__/
 *.py[cod]
@@ -16,3 +17,6 @@ __pycache__/
 /assets/resnet10_params.pkl
 /resolved_config.yaml
 configs/sites/local*.yaml
+
+# Local FFmpeg shared-library environment (not Python packages).
+/.runtime/

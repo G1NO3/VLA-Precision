@@ -103,6 +103,33 @@ def create_rlds_dataloader(
 def _compute(config: _config.TrainConfig, root_config, max_frames: int | None = None):
     data_config = config.data.create(config.assets_dirs, config.model)
 
+    # Prepared pipette arrays already contain the final numeric layout. Compute
+    # exactly the sampled chunk distribution without decoding unused images.
+    from pathlib import Path
+    from vla_precision.data.pipette import PipetteDataset
+    root = root_config.data.lerobot_root
+    if root is not None and (Path(root) / "manifest.json").is_file():
+        if root_config.data.state_indices or root_config.data.action_indices:
+            raise ValueError("Prepared pipette data already has the final numeric layout")
+        dataset = PipetteDataset(root, config.model.action_horizon)
+        count = len(dataset) if max_frames is None else min(len(dataset), max_frames)
+        if count < 2:
+            raise ValueError("Need at least two samples for normalization")
+        values = {key: [] for key in ("state", "actions")}
+        for i in range(count):
+            item = dataset.numeric_item(i)
+            for key in values:
+                values[key].append(item[key])
+        norm_stats = {}
+        for key, arrays in values.items():
+            stats = normalize.RunningStats()
+            stats.update(np.stack(arrays).astype(np.float64))
+            norm_stats[key] = stats.get_statistics()
+        output_path = config.assets_dirs / data_config.repo_id
+        normalize.save(output_path, norm_stats)
+        print(f"Wrote train-only stats for {count} complete chunks to {output_path}")
+        return
+
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames

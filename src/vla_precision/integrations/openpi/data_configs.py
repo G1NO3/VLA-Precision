@@ -14,7 +14,7 @@ from openpi.models import model as openpi_model
 from openpi.training import config as openpi_config
 from typing_extensions import override
 
-from vla_precision.integrations.openpi.policies import dual_ur, franka, ur5e
+from vla_precision.integrations.openpi.policies import dual_ur, franka, ur5e, pipette
 
 
 def make_robot_data_config_template(factory, *, dual: bool = False):
@@ -184,5 +184,30 @@ class LeRobotFrankaDataConfig(openpi_config.DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack,
             data_transforms=data_transforms,
+            model_transforms=openpi_config.ModelTransformFactory()(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PipetteDataConfig(openpi_config.DataConfigFactory):
+    extra_delta_transform: bool = False
+    state_key: str = "observation.state"
+    action_key: str = "action"
+    image_key_map: dict[str, str] | None = None
+
+    def create(self, assets_dirs, model_config):
+        if self.extra_delta_transform:
+            raise ValueError("Pipette actions are already Cartesian deltas")
+        images = self.image_key_map or {
+            "base_0_rgb": "observation.images.rgb",
+            "left_wrist_0_rgb": "observation.images.wrist_left",
+            "right_wrist_0_rgb": "observation.images.wrist_right",
+        }
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=transforms.Group(inputs=[transforms.RepackTransform({
+                **images, "state": self.state_key, "actions": self.action_key, "prompt": "task",
+            })]),
+            data_transforms=transforms.Group(inputs=[pipette.PipetteInputs()], outputs=[pipette.PipetteOutputs()]),
             model_transforms=openpi_config.ModelTransformFactory()(model_config),
         )
