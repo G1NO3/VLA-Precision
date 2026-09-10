@@ -1,5 +1,11 @@
 # π0.5 pipette: repository handoff and larger-GPU plan
 
+**2026-09-11 follow-up:** HIL194 data and the original π0.5 base are downloaded;
+single-B200 full-parameter save/resume/inference preflight passed, and a 5,000-step
+run, held-out evaluation, checkpoint upload and 30-Hz GUI integration are complete.
+See [HIL194 full-SFT run record](PI05_HIL194_FULL_SFT.md).
+The audit below remains the historical 46-episode LoRA handoff.
+
 Updated 2026-09-10. Source workspace: `/home/jwang3617/pipette`.
 This is the starting document for continuing the work on another cluster.
 The status below describes completed work; the GPU experiments in section 8 are

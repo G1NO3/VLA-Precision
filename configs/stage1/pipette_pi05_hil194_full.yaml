@@ -1,0 +1,45 @@
+schema_version: 1
+cuda_visible_devices: '5'
+xla_memory_fraction: 0.9
+openpi:
+  name: pi05_full_finetune_pipette
+  exp_name: pipette_hil194_full_20260911
+  initialization_checkpoint: /data/jwang3617/pipette/models/openpi/openpi-assets/checkpoints/pi05_base/params
+  model:
+    action_horizon: 10
+    action_dim: 32
+    max_token_len: 200
+  batch_size: 16
+  num_train_steps: 5000
+  save_interval: 500
+  resume: false
+  overwrite: false
+  fsdp_devices: 1
+  lr_schedule:
+    warmup_steps: 100
+    peak_lr: 1.0e-05
+    decay_steps: 5000
+    decay_lr: 1.0e-06
+  num_workers: 0
+  ema_decay: null
+  log_interval: 10
+  keep_period: 1000
+  wandb_enabled: false
+  seed: 42
+data:
+  lerobot_repo_id: local/g1-pipette-hil194-pi05-30hz-v1
+  lerobot_root: /data/jwang3617/pipette/datasets/g1-pipette-hil194-pi05-30hz-v1
+  state_indices: []
+  action_indices: []
+  image_key_map:
+    base_0_rgb: observation.images.rgb
+    left_wrist_0_rgb: observation.images.wrist_left
+    right_wrist_0_rgb: observation.images.wrist_right
+  extra_delta_transform: false
+  state_key: observation.state
+  action_key: action
+  prompt_from_task: false
+paths:
+  checkpoint_root: /data/jwang3617/pipette/checkpoints/vla-precision-stage1
+  cache_root: /data/jwang3617/pipette/cache/vla-precision
+  openpi_assets_root: /data/jwang3617/pipette/assets

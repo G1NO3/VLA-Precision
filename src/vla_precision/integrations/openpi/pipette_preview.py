@@ -42,8 +42,10 @@ def decode_live_packet(raw: bytes, *, now_ms: int | None = None):
         raise ValueError('Unsupported HIL observation schema')
     if packet.get('action_frame') != 'pelvis':
         raise ValueError('Expected pelvis-frame observation')
-    if packet.get('action_units') != 'metres_per_10hz_step':
-        raise ValueError('Unexpected HIL wire units; this adapter reads the current 10 Hz wire')
+    units = packet.get('action_units')
+    wire_hz = {'metres_per_10hz_step':10, 'metres_per_30hz_step':30}.get(units)
+    if wire_hz is None or packet.get('action_hz', wire_hz) != wire_hz:
+        raise ValueError('Expected consistent 10-Hz or 30-Hz HIL wire units')
     if packet.get('image_color_after_decode') != 'BGR':
         raise ValueError('Unknown JPEG color convention')
     stamp = packet.get('timestamp_ms')
@@ -75,7 +77,7 @@ def decode_live_packet(raw: bytes, *, now_ms: int | None = None):
     return observation, {'source': 'live_hil', 'observation_seq': seq,
                          'timestamp_ms': int(stamp), 'age_at_receive_ms': age,
                          'episode': packet.get('episode_id'), 'frame': packet.get('step_index'),
-                         'source_action_hz': 10}
+                         'source_action_hz': wire_hz}
 
 
 def write_json(path: Path, value):
@@ -98,8 +100,8 @@ class PreviewModel:
         self.resolved = load_stage1_config(config_path)
         self.config = build_stage1_train_config(self.resolved.config)
         c = self.config
-        if c.name != 'pi05_lora_finetune_pipette' or not c.model.discrete_state_input:
-            raise ValueError('Preview requires the pipette pi05 LoRA configuration with discrete state')
+        if c.name not in ('pi05_lora_finetune_pipette', 'pi05_full_finetune_pipette') or not c.model.discrete_state_input:
+            raise ValueError('Preview requires a pipette pi05 full or LoRA configuration with discrete state')
         if c.model.action_dim != 32 or c.model.action_horizon != 10:
             raise ValueError('Expected the trained 32-D, 10-step action contract')
         self.datasets = [PipetteDataset(self.resolved.config.data.lerobot_root, 10, split=split)
@@ -124,7 +126,8 @@ class PreviewModel:
             'checkpoint': str(checkpoint.resolve()), 'config': str(config_path.resolve()),
             'config_sha256': self.resolved.config_sha256,
             'norm_stats_sha256': hashlib.sha256(stats_path.read_bytes()).hexdigest(),
-            'model': c.name, 'action_hz': 30, 'action_horizon': 10, 'flow_steps': 10, 'frame': 'pelvis',
+            'model': c.name, 'training_mode': 'full' if '_full_' in c.name else 'lora',
+            'checkpoint_step_directory': checkpoint.name, 'action_hz': 30, 'action_horizon': 10, 'flow_steps': 10, 'frame': 'pelvis',
             'dataset_root': str(self.datasets[0].root.resolve()),
             'source_revision': self.manifest['source_revision'],
             'state_source': self.manifest['state_source'],
@@ -154,17 +157,8 @@ class PreviewModel:
             observation['task'] = self.manifest['prompt']
         else:
             raise ValueError('Source must be dataset or live_hil')
-        # Display and record the exact RGB pixels passed to native preprocessing.
-        for view in VIEWS:
-            key = f'observation.images.{view}'
-            observation[key] = resize_with_pad(observation[key], 224, 224)
         seed = int(request.get('seed', 42))
-        noise = np.random.default_rng(seed).standard_normal((10, 32)).astype(np.float32)
-        start = time.perf_counter()
-        actions = np.asarray(self.policy.infer(observation, noise=noise)['actions'], np.float32)
-        elapsed = (time.perf_counter() - start) * 1000
-        if actions.shape != (10, 3) or not np.isfinite(actions).all():
-            raise ValueError('Model produced invalid XYZ actions')
+        actions, elapsed = self.predict(observation, seed=seed)
         folder = run_dir / request['id']
         folder.mkdir()
         inputs = {'state': observation['observation.state'],
@@ -183,3 +177,17 @@ class PreviewModel:
             result['source_age_at_result_ms'] = result['timestamp_ms'] - meta['timestamp_ms']
         write_json(folder / 'result.json', result)
         return result
+
+    def predict(self, observation, *, seed=42):
+        from openpi_client.image_tools import resize_with_pad
+        # Preserve the same RGB preprocessing and noise as preview/evaluation.
+        for view in VIEWS:
+            key = f'observation.images.{view}'
+            observation[key] = resize_with_pad(observation[key], 224, 224)
+        noise = np.random.default_rng(seed).standard_normal((10, 32)).astype(np.float32)
+        start = time.perf_counter()
+        actions = np.asarray(self.policy.infer(observation, noise=noise)['actions'], np.float32)
+        elapsed = (time.perf_counter() - start) * 1000
+        if actions.shape != (10, 3) or not np.isfinite(actions).all():
+            raise ValueError('Model produced invalid XYZ actions')
+        return actions, elapsed

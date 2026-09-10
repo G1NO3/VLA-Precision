@@ -24,8 +24,11 @@ def main():
     assert c.model.pi05 and c.model.discrete_state_input and dc.use_quantile_norm
     train = PipetteDataset(root.data.lerobot_root, c.model.action_horizon)
     val = PipetteDataset(root.data.lerobot_root, c.model.action_horizon, split='validation')
-    assert set(val.episodes) == set(VALIDATION_EPISODES)
-    assert len(train.episodes) == 37 and not set(train.episodes) & set(val.episodes)
+    expected_validation = set(train.manifest.get('validation_episodes', VALIDATION_EPISODES))
+    expected_episodes = {episode['episode'] for episode in train.manifest['episodes']}
+    assert set(val.episodes) == expected_validation
+    assert set(train.episodes) == expected_episodes - expected_validation
+    assert not set(train.episodes) & set(val.episodes)
     max_tokens = 0
     tokenizer = PaligemmaTokenizer(1024)
     normalize = transforms.Normalize(dc.norm_stats, use_quantiles=True)
@@ -50,7 +53,11 @@ def main():
     assert max_tokens <= c.model.max_token_len, (max_tokens, c.model.max_token_len)
     # Independently decode first/middle/last camera frames in one train and one val episode.
     camera_checks = 0
-    for dataset, ep in ((train, 0), (val, VALIDATION_EPISODES[0])):
+    camera_episodes = [(train, min(train.episodes)), (val, min(val.episodes))]
+    # The HIL194 union has a second recording session starting at episode 46.
+    if len(expected_episodes) == 194:
+        camera_episodes += [(ds, min(ep for ep in ds.episodes if ep >= 46)) for ds in (train, val)]
+    for dataset, ep in camera_episodes:
         numeric = dataset.episodes[ep]
         for view in VIEWS:
             path = Path(dataset.manifest['source']) / f'videos/chunk-000/observation.images.{view}/episode_{ep:06d}.mp4'
@@ -75,6 +82,7 @@ def main():
               'train_chunks': len(train), 'validation_chunks': len(val), 'max_prompt_tokens': max_tokens,
               'camera_frame_checks_exact': camera_checks, 'discrete_state_input': True,
               'quantile_normalization': True, 'action_shape': list(batch[1].shape), 'status': 'passed'}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

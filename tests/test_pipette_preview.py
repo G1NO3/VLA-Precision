@@ -96,3 +96,11 @@ def test_prediction_records_exact_inputs_and_mm(tmp_path):
         for v in VIEWS:
             png = cv2.cvtColor(cv2.imread(str(folder / f'{v}.png')), cv2.COLOR_BGR2RGB)
             np.testing.assert_array_equal(png, inputs[v])
+
+
+def test_native_30hz_live_packet():
+    p=packet();p.update(action_hz=30,action_units='metres_per_30hz_step')
+    _,meta=decode_live_packet(msgpack.packb(p),now_ms=10200)
+    assert meta['source_action_hz']==30
+    p['action_hz']=10
+    with pytest.raises(ValueError):decode_live_packet(msgpack.packb(p),now_ms=10200)
