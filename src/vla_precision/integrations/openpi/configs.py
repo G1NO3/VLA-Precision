@@ -44,6 +44,14 @@ _ACTION_EXPERT_ONLY_FREEZE_FILTER = nnx.Not(
 # explicit TrainConfig here; no secondary stage/model/platform profile exists.
 _CONFIGS = [
     openpi_config.TrainConfig(
+        name="pi05_acob_pipette",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True,
+                                 action_expert_variant="gemma_300m_lora"),
+        data=PipetteDataConfig(repo_id=""),
+        freeze_filter=_ACTION_EXPERT_ONLY_FREEZE_FILTER,
+        ema_decay=None,
+    ),
+    openpi_config.TrainConfig(
         name="pi05_lora_finetune_pipette",
         model=pi0_config.Pi0Config(
             pi05=True, discrete_state_input=True,

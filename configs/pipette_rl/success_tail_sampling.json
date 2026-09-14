@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "success_tail_fraction": 0.5,
+  "success_tail_seconds": 3.0,
+  "terminal_fraction_within_tail": 0.2
+}

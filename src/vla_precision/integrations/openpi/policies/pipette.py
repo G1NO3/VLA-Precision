@@ -4,6 +4,11 @@ import numpy as np
 from openpi import transforms
 from vla_precision.integrations.openpi.policies.dual_ur import _parse_image
 
+def make_pipette_example():
+    return {"state": np.zeros(32, np.float32), "prompt": "Attach a green pipette tip from the tip rack to the pipette.",
+            **{k: np.zeros((224, 224, 3), np.uint8)
+               for k in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")}}
+
 @dataclasses.dataclass(frozen=True)
 class PipetteInputs(transforms.DataTransformFn):
     def __call__(self, data):

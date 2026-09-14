@@ -51,6 +51,13 @@ from vla_precision.integrations.openpi.training_state import initialize_train_st
 from vla_precision.logging import debug_record
 
 
+def _eligible_bc_loss(losses, weights, eligible):
+    """Mask artificial control transitions, even in successful episodes."""
+    weights = weights * jnp.asarray(eligible, dtype=weights.dtype)
+    loss = jnp.sum(losses * weights) / jnp.maximum(jnp.sum(weights), 1.0)
+    return loss, weights
+
+
 def _normalize_actor_weights(flow_weight: float, imp_weight: float, ref_weight: float) -> tuple[float, float, float]:
     weights = np.asarray([flow_weight, imp_weight, ref_weight], dtype=np.float64)
     if not np.all(np.isfinite(weights)):
@@ -626,9 +633,13 @@ class ACoBAgent(flax.struct.PyTreeNode):
                     success_bc_weights = jnp.asarray(batch["episode_succeed"], dtype=bc_loss_per_sample.dtype)
                 intervention_bc_weights = jnp.zeros_like(bc_loss_per_sample)
                 if "intervened" in batch:
-                    intervention_bc_weights = jnp.asarray(batch["intervened"], dtype=bc_loss_per_sample.dtype)
+                    intervention_bc_weights = jnp.asarray(
+                        batch.get("bc_intervened", batch["intervened"]), dtype=bc_loss_per_sample.dtype)
                 bc_weights = jnp.maximum(success_bc_weights, intervention_bc_weights)
-                bc_loss = jnp.sum(bc_loss_per_sample * bc_weights) / jnp.maximum(jnp.sum(bc_weights), 1.0)
+                # Control release debounce is not a demonstration, including
+                # when the enclosing episode was eventually labelled success.
+                bc_loss, bc_weights = _eligible_bc_loss(
+                    bc_loss_per_sample, bc_weights, batch.get("bc_eligible", jnp.ones_like(bc_weights)))
         else:
             raise NotImplementedError("ACoB actor loss requires cached OpenPI KV embeddings.")
 
@@ -960,6 +971,7 @@ def _create_acob_agent(
     debug_enabled: bool,
     critic_resnet10_params_path: str = DEFAULT_CRITIC_RESNET10_PARAMS_PATH,
     dual_arm: bool = False,
+    pipette_xyz: bool = False,
 ):
     ablate_critic_pref, ablate_actor_bc, ablate_actor_advantage = _validate_ablation_flags(
         ablate_critic_pref=ablate_critic_pref,
@@ -1052,7 +1064,9 @@ def _create_acob_agent(
             f"sample_action horizon {env_action_horizon} does not match task.action_horizon {action_horizon}"
         )
     env_action_dim = int(sample_action.shape[-1])
-    expected_env_action_dim = 14 if dual_arm else (6 if fix_gripper else 7)
+    expected_env_action_dim = 3 if pipette_xyz else (14 if dual_arm else (6 if fix_gripper else 7))
+    if pipette_xyz and (dual_arm or not fix_gripper):
+        raise ValueError("Pipette XYZ has no learned gripper or dual-arm action")
     if env_action_dim != expected_env_action_dim:
         raise ValueError(
             f"dual_arm={dual_arm}, fixed_gripper={fix_gripper} requires environment action dim "
@@ -1088,6 +1102,7 @@ def _create_acob_agent(
         dual_arm=bool(dual_arm),
         learned_state_dim=None if dual_arm or fix_gripper else int(np.asarray(sample_obs["state"]).shape[-1]),
         action_horizon=env_action_horizon,
+        pipette_xyz=pipette_xyz,
         debug_fn=debug_record if debug_enabled else None,
     )
     use_context = True

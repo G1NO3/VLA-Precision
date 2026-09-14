@@ -1,0 +1,30 @@
+schema_version: 1
+name: pipette_hil293_10epochs_relative_acob
+baseline: models/pi05-pipette-hil293-full-bc-10epochs-20260914/checkpoints/88612
+policy_profile: pipette_pi05_hil293
+replay_db: datasets/pipette-hil293-10epochs-acob/replay.sqlite3
+output: outputs/pipette-hil293-10epochs-acob
+seed: 42
+batch_size: 2
+learning_rate: 0.00001
+critic_warmup_steps: 100
+critic_updates_per_step: 2
+checkpoint_every: 100
+min_online: 100
+# Primitive-step RL: preserve the HIL actor's existing 30 Hz asynchronous wire.
+# The pi05 action expert still predicts 10 steps; TD/BC credit uses one step.
+action_hz: 30
+model_horizon: 10
+credit_horizon: 1
+discount: 0.99
+success_reward: 1.0
+failure_reward: 0.0
+time_reward: -0.001
+actor_flow_weight: 0.25
+actor_improvement_weight: 0.5
+actor_reference_weight: 0.25
+critic_preference_weight: 50.0
+critic_preference_margin: 0.05
+actor_improvement_temperature: 0.05
+correction_fraction: 0.5
+max_step_mm: 2.0

@@ -14,6 +14,9 @@
   <img src="assets/workflow.svg" alt="Teleoperation to supervised fine-tuning to online RL post-training to real-robot deployment" width="100%">
 </p>
 
+The local G1 pipette integration (HIL293 relative π0.5, native JAX ACoB,
+VLAPolicyBridge GUI) is documented in [PIPETTE_ACOB_RL.md](docs/PIPETTE_ACOB_RL.md).
+
 ## 🎮 1. Teleoperation and Data Collection
 
 The following projects can be used to collect demonstrations in LeRobot format:

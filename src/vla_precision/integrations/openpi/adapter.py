@@ -91,12 +91,14 @@ class OpenPIObservationAdapter:
         dual_arm: bool = False,
         learned_state_dim: int | None = None,
         action_horizon: int | None = None,
+        pipette_xyz: bool = False,
         debug_fn: DebugFn | None = None,
     ):
         self.train_config = train_config
         self.task_desc = task_desc
         self.debug_fn = debug_fn
         self.fixed_gripper = bool(fixed_gripper)
+        self.pipette_xyz = bool(pipette_xyz)
         self.dual_arm = bool(dual_arm)
         self.learned_state_dim = None if learned_state_dim is None else int(learned_state_dim)
         self.action_horizon = int(action_horizon if action_horizon is not None else train_config.model.action_horizon)
@@ -154,6 +156,11 @@ class OpenPIObservationAdapter:
 
     def _validate_arm_schema(self) -> None:
         """Require norm stats to match the selected physical state/action schema."""
+        if self.pipette_xyz:
+            if (self.dual_arm or len(self.source_image_keys) != 3
+                    or self.state_input_dim != 32 or self.action_norm_dim != 3):
+                raise ValueError("Pipette requires three cameras, 32-D state and 3-D delta XYZ stats")
+            return
         if not self.dual_arm:
             if len(self.source_image_keys) != 2:
                 raise ValueError(
