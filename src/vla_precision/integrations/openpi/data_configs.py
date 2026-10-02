@@ -211,3 +211,35 @@ class PipetteDataConfig(openpi_config.DataConfigFactory):
             data_transforms=transforms.Group(inputs=[pipette.PipetteInputs()], outputs=[pipette.PipetteOutputs()]),
             model_transforms=openpi_config.ModelTransformFactory()(model_config),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class PipetteFullTaskDataConfig(PipetteDataConfig):
+    def create(self, assets_dirs, model_config):
+        from vla_precision.integrations.openpi.policies.pipette_fulltask import (
+            FullTaskInputs, FullTaskOutputs, FullTaskStateDropout,
+        )
+        if self.extra_delta_transform or not model_config.pi05 or not model_config.discrete_state_input:
+            raise ValueError("Full-task data requires pi05 discrete state and no extra delta transform")
+        if model_config.action_dim != 32 or model_config.action_horizon != 30 or model_config.max_token_len < 320:
+            raise ValueError("Full-task pi05 requires 32 actions, 30 steps, >=320 text tokens")
+        images = self.image_key_map or {
+            "base_0_rgb": "observation.images.rgb",
+            "left_wrist_0_rgb": "observation.images.wrist_left",
+        }
+        if set(images) != {"base_0_rgb", "left_wrist_0_rgb"}:
+            raise ValueError("Expected head RGB and LEFT wrist camera only")
+        model_transforms = openpi_config.ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=transforms.Group(inputs=[transforms.RepackTransform({
+                **images, "state": self.state_key, "actions": self.action_key, "prompt": "task",
+            })]),
+            data_transforms=transforms.Group(inputs=[FullTaskInputs()], outputs=[FullTaskOutputs()]),
+            # Native tokenizer sees 59 dimensions; PadStatesAndActions only pads
+            # smaller arrays and does NOT truncate 59 to the 32 action channels.
+            model_transforms=transforms.Group(
+                inputs=[FullTaskStateDropout(), *model_transforms.inputs],
+                outputs=model_transforms.outputs,
+            ),
+        )

@@ -60,7 +60,7 @@ class TorchDataLoader(openpi_data_loader.TorchDataLoader):
         self.torch_loader.worker_init_fn = _worker_init_fn
 
 
-def transform_dataset(dataset, data_config, *, skip_norm_stats: bool = False):
+def transform_dataset(dataset, data_config, *, skip_norm_stats: bool = False, training: bool = False):
     """Apply OpenPI's transform order with a spawn-safe dataset wrapper."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -68,15 +68,24 @@ def transform_dataset(dataset, data_config, *, skip_norm_stats: bool = False):
             raise ValueError("Normalization stats not found. Run Stage-I norm-stats first.")
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
+    transform_fns = [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
-        ],
-    )
+        ]
+    transform_fns = [fn.with_training(training) if hasattr(fn, "with_training") else fn
+                     for fn in transform_fns]
+    return TransformedDataset(dataset, transform_fns)
+
+
+def prepared_dataset(root, action_horizon, *, split="train"):
+    import json
+    from vla_precision.data.pipette import PipetteDataset
+    from vla_precision.data.pipette_fulltask import FORMAT, FullTaskDataset
+    manifest = json.loads((Path(root) / "manifest.json").read_text())
+    cls = FullTaskDataset if manifest.get("format") == FORMAT else PipetteDataset
+    return cls(root, action_horizon, split=split)
 
 
 def _lerobot_dataset(dataset):
@@ -106,7 +115,7 @@ def create_torch_dataset(
     if (root / "manifest.json").is_file():
         if root_config.data.state_indices or root_config.data.action_indices:
             raise ValueError("Prepared pipette data already has the final state/action layout")
-        return PipetteDataset(root, action_horizon)
+        return prepared_dataset(root, action_horizon)
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
@@ -167,14 +176,15 @@ def create_data_loader(
         / "metadata.json"
     )
     from vla_precision.data.pipette import PipetteDataset
-    if not isinstance(dataset, PipetteDataset):
+    from vla_precision.data.pipette_fulltask import FullTaskDataset
+    if not isinstance(dataset, (PipetteDataset, FullTaskDataset)):
         metadata = materialize_lerobot_indices(
             _lerobot_dataset(dataset),
             root_config.data,
             metadata_path=metadata_path,
         )
         logger.info("materialized OpenPI training columns: schema_sha256=%s", metadata.schema_sha256)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, training=True)
 
     local_batch_size = train_config.batch_size // jax.process_count()
     loader = TorchDataLoader(

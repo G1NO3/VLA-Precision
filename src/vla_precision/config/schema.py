@@ -277,6 +277,12 @@ class Stage1OpenPIConfig:
     keep_period: int | None = 5_000
     wandb_enabled: bool = True
     seed: int = 42
+    # Opt-in five-phase JAX holdout evaluation; legacy recipes stay unchanged.
+    eval_interval: int = 0
+    eval_samples: int = 480
+    eval_batch_size: int = 4
+    eval_seed: int = 42
+    num_inference_steps: int = 10
 
 
 @dataclass(frozen=True)

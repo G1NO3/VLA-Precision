@@ -25,6 +25,7 @@ from vla_precision.integrations.openpi.data_loader import (
     TransformedDataset,
     _lerobot_dataset,
     create_torch_dataset,
+    prepared_dataset,
 )
 
 
@@ -111,23 +112,30 @@ def _compute(config: _config.TrainConfig, root_config, max_frames: int | None = 
     if root is not None and (Path(root) / "manifest.json").is_file():
         if root_config.data.state_indices or root_config.data.action_indices:
             raise ValueError("Prepared pipette data already has the final numeric layout")
-        dataset = PipetteDataset(root, config.model.action_horizon)
+        dataset = prepared_dataset(root, config.model.action_horizon)
         count = len(dataset) if max_frames is None else min(len(dataset), max_frames)
         if count < 2:
             raise ValueError("Need at least two samples for normalization")
-        values = {key: [] for key in ("state", "actions")}
-        for i in range(count):
-            item = dataset.numeric_item(i)
-            for key in values:
-                values[key].append(item[key])
-        norm_stats = {}
-        for key, arrays in values.items():
-            stats = normalize.RunningStats()
-            stats.update(np.stack(arrays).astype(np.float64))
-            norm_stats[key] = stats.get_statistics()
+        from vla_precision.data.pipette_fulltask import FullTaskDataset
+        stats = {key: normalize.RunningStats() for key in ("state", "actions")}
+        # Preserve legacy one-shot histogram results for old tip-attachment
+        # runs; bound RAM only for the new 30x32 full-task chunks.
+        block_size = 256 if isinstance(dataset, FullTaskDataset) else count
+        for start in tqdm.tqdm(range(0, count, block_size), desc="Numeric train statistics"):
+            items = [dataset.numeric_item(i) for i in range(start, min(start + block_size, count))]
+            for key in stats:
+                stats[key].update(np.stack([item[key] for item in items]).astype(np.float64))
+        norm_stats = {key: value.get_statistics() for key, value in stats.items()}
         output_path = config.assets_dirs / data_config.repo_id
         normalize.save(output_path, norm_stats)
-        print(f"Wrote train-only stats for {count} complete chunks to {output_path}")
+        if isinstance(dataset, FullTaskDataset):
+            import hashlib
+            import json
+            receipt = dict(manifest_sha256=hashlib.sha256((Path(root) / "manifest.json").read_bytes()).hexdigest(),
+                           norm_stats_sha256=hashlib.sha256((output_path / "norm_stats.json").read_bytes()).hexdigest(),
+                           chunks=count, split="train", horizon=config.model.action_horizon)
+            (output_path / "norm_contract.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        print(f"Wrote train-only stats for {count} chunks to {output_path}")
         return
 
     if data_config.rlds_data_dir is not None:

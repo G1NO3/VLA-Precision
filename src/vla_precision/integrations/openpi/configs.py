@@ -25,6 +25,7 @@ from vla_precision.integrations.openpi.data_configs import (
     LeRobotFrankaDataConfig,
     LeRobotUR5eDataConfig,
     PipetteDataConfig,
+    PipetteFullTaskDataConfig,
     make_robot_data_config_template,
 )
 
@@ -43,6 +44,16 @@ _ACTION_EXPERT_ONLY_FREEZE_FILTER = nnx.Not(
 # Adding a robot/config means adding a DataConfigFactory and one
 # explicit TrainConfig here; no secondary stage/model/platform profile exists.
 _CONFIGS = [
+    openpi_config.TrainConfig(
+        name="pi05_full_finetune_pipette_fulltask",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True,
+                                 action_dim=32, action_horizon=30, max_token_len=320),
+        data=PipetteFullTaskDataConfig(repo_id=""),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        ema_decay=None,
+    ),
     openpi_config.TrainConfig(
         name="pi05_acob_pipette",
         model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True,

@@ -192,6 +192,7 @@ def train_step(
 
 def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
     LOGGER.info("running on %s", platform.node())
+    np.random.seed(config.seed)
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -219,6 +220,8 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
         enabled=config.wandb_enabled,
         root_config=dataclasses.asdict(resolved.config),
     )
+    # Keep the resolved YAML beside native params/assets for later inference.
+    resolved.save(config.checkpoint_dir / "resolved_config.yaml")
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -246,6 +249,13 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    evaluator = None
+    if resolved.config.openpi.eval_interval > 0:
+        if config.name != "pi05_full_finetune_pipette_fulltask":
+            raise ValueError("This holdout evaluator is specific to pipette_fulltask")
+        from vla_precision.integrations.openpi.fulltask_eval import FullTaskEvaluator
+        evaluator = FullTaskEvaluator(config, resolved.config)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -276,11 +286,25 @@ def _train(config: _config.TrainConfig, resolved: ResolvedStage1Config):
             infos = []
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        if evaluator is not None:
+            # Native checkpoints are labeled with COMPLETED updates, not the
+            # loop's pre-update index. Eval never disables training augmentation.
+            completed = step + 1
+            final = completed == config.num_train_steps
+            if completed % resolved.config.openpi.eval_interval == 0 or final:
+                with sharding.set_mesh(mesh):
+                    metrics = evaluator.evaluate(train_state, completed)
+                wandb.log(metrics, step=completed)
+                LOGGER.info("Holdout step %s: %s", completed, metrics)
+            if completed % config.save_interval == 0 or final:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, completed)
+        elif (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     LOGGER.info("waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if evaluator is not None:
+        evaluator.close()
 
 
 def run_stage1_training(resolved: ResolvedStage1Config) -> None:
