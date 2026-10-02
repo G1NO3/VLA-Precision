@@ -57,6 +57,8 @@ ln -s /path/to/storage/train_data ./train_data
 
 G1 双手移液五阶段任务的原生 π0.5 JAX 数据准备、配置、验证和断点恢复，见[五阶段训练说明](docs/PI05_FULLTASK_JAX_TRAINING_ZH.md)。它独立于旧的单手插 tip 配方，不使用 starVLA 的 PyTorch π0.5。
 
+从新服务器开始安装、下载、预检、短训练、五阶段正式训练及备份，请按[远程服务器完整操作指南](docs/PI05_FULLTASK_REMOTE_TRAINING_ZH.md)执行。
+
 配置文件：
 
 ```text

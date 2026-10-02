@@ -4,6 +4,8 @@
 
 目前已完成数值数据准备、五份配置生成、训练集归一化和 CPU 输入检查；尚未启动完整训练。启动前必须在训练机补齐视频缓存，并验证 GPU 和磁盘容量。
 
+在另一台服务器从零搭建环境和启动训练，请使用[远程服务器完整操作指南](PI05_FULLTASK_REMOTE_TRAINING_ZH.md)，包含逐步命令、独立 smoke test、GPU 分配、W&B、恢复和模型导出。
+
 ## 数据与任务
 
 来源为 [237 条五阶段示教](https://huggingface.co/datasets/jren313/g1-pipette-2view-teleop0925-5task-eerel)，固定 revision `340ebabb48e6d1fb42f92178fba0f6ded87322df`。237 条是切分后的阶段 episodes，不是 237 次完整五阶段任务。该数据包含拿移液枪、拿试管、瞄准管口、放回试管和放回移液枪；不要把它的第三阶段等同于旧数据中的绿色 tip attachment。
