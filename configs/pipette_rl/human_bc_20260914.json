@@ -1,0 +1,19 @@
+{
+  "algorithm": "human_correction_flow_bc",
+  "baseline": "models/pi05-pipette-hil293-full-bc-10epochs-20260914/checkpoints/88612",
+  "replay_db": "datasets/pipette-hil293-10epochs-acob/replay.sqlite3",
+  "source_contract": "7c971aa193935dc2c32ddbc52ba0f3e95305462bdd89af268ff719029650d4b9",
+  "norm_sha256": "b53743394426b75cdfe6120e28a924874b46d43dfd108dbc590ed7178bd65609",
+  "output": "outputs/pi05-hil293-human-bc-20260914",
+  "timezone": "America/New_York",
+  "start_local": "2026-09-14T00:00:00",
+  "end_local": "2026-09-15T06:00:00",
+  "horizon": 10,
+  "minimum_action_mm": 0.01,
+  "max_gap_s": 0.15,
+  "validation_fraction": 0.2,
+  "epochs": 3,
+  "batch_size": 4,
+  "learning_rate": 0.00002,
+  "seed": 42
+}

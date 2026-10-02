@@ -4,7 +4,8 @@ from pathlib import Path
 import json, sqlite3, sys
 import numpy as np
 from .config import IMAGE_MAP, WORKSPACE
-from .sampling import validate_sampling
+from .sampling import validate_sampling, tail_settings
+from .rewards import resolve_training_rewards
 
 sys.path.insert(0, str(WORKSPACE / "VLAPolicyBridge"))
 from vla_policy_bridge.hil.replay import _decode_observation
@@ -24,13 +25,15 @@ def observation(raw):
 
 
 class Replay:
-    def __init__(self, config, *, sampling=None):
+    def __init__(self, config, *, sampling=None, rewards=None):
         self.config = config
         self.sampling = validate_sampling(sampling)
+        self.rewards = resolve_training_rewards(config,rewards)
         self.index = []
         self.closed = {}
         self.rejected = {}
         self.discarded = set()
+        self._collection_signature = None
 
     @staticmethod
     def discarded_ids(db):
@@ -63,7 +66,7 @@ class Replay:
                 if ep in self.closed or ep in self.rejected:
                     continue
                 rows = db.execute(
-                    "SELECT id,step_index,reward,terminated,truncated,intervention,info_json FROM transitions WHERE buffer='online' AND episode_id=? ORDER BY step_index",
+                    "SELECT id,step_index,reward,terminated,truncated,intervention,info_json,timestamp_ns FROM transitions WHERE buffer='online' AND episode_id=? ORDER BY step_index",
                     (ep,),
                 ).fetchall()
                 if not rows or rows[-1][4] or not rows[-1][3]:
@@ -83,29 +86,120 @@ class Replay:
                     self.rejected[ep] = "early terminal"
                     continue
                 success = rows[-1][2] > 0
-                self.closed[ep] = {"success": success, "steps": len(rows)}
+                self.closed[ep] = {"success": success, "steps": len(rows),
+                                   "last_timestamp_ns": max(r[7] for r in rows),
+                                   "last_row_id": max(r[0] for r in rows)}
                 self.index.extend((r[0], ep, bool(r[5])) for r in rows)
+            if self.sampling and self.sampling['schema_version'] in (3,4):
+                self._refresh_collection_policies(db)
         finally:
             db.close()
+
+    @staticmethod
+    def collection_policy_id(model, contract):
+        """Identify behaviour weights, never offline counterfactual weights."""
+        if model.get('source') != 'live_inference' or model.get('mode') != 'hil_policy':
+            return None
+        digest = model.get('acob_state_sha256')
+        if isinstance(digest, str) and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest):
+            return 'acob:' + digest
+        # The collector contract binds the BC baseline. Require an explicit
+        # no-adapter declaration; absent provenance does not imply BC.
+        if ('acob_state_sha256' in model and digest is None
+                and not model.get('acob_checkpoint') and model.get('checkpoint')):
+            return 'bc:' + contract
+        return None
+
+    def _refresh_collection_policies(self, db):
+        """Recover legacy episode lineage from matching live proposal records.
+
+        Online proposals exist during human takeover too. Match the actor's
+        observation key, episode, step and contract; step-only/offline joins
+        could falsely attribute an episode to another policy. Cache unchanged
+        append-only proposal tables, while allowing late online records.
+        """
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_proposals_v1'").fetchone():
+            return
+        signature = (db.execute('SELECT MAX(rowid) FROM policy_proposals_v1').fetchone()[0],
+                     frozenset(self.closed))
+        if signature == self._collection_signature:
+            return
+        policies = {ep: set() for ep in self.closed}
+        for ep, raw in db.execute("""
+            SELECT DISTINCT p.episode_id,p.model_json FROM policy_proposals_v1 p
+            JOIN transitions t ON t.buffer='online' AND t.episode_id=p.episode_id
+              AND t.step_index=p.step_index
+              AND json_extract(t.info_json,'$.policy_observation_key')=p.key
+            WHERE p.kind='online' AND p.contract=?
+        """, (self.config['contract_sha256'],)):
+            if ep not in policies:
+                continue
+            try:
+                identity = self.collection_policy_id(json.loads(raw), self.config['contract_sha256'])
+            except (ValueError, AttributeError, TypeError):
+                identity = None
+            policies[ep].add(identity)
+        for ep, identities in policies.items():
+            self.closed[ep]['collection_policy_id'] = (
+                next(iter(identities)) if len(identities) == 1 else None)
+        self._collection_signature = signature
+
+    def latest_collection_policy_id(self):
+        if not self.closed:
+            return None
+        newest = max(self.closed, key=lambda ep: (
+            self.closed[ep]['last_timestamp_ns'], self.closed[ep]['last_row_id']))
+        # Do not silently call an older known policy the latest collection if
+        # the newest valid episode has unknown/mixed provenance.
+        return self.closed[newest].get('collection_policy_id')
+
+    def priority_episode_ids(self):
+        if not self.sampling or self.sampling['schema_version'] not in (3,4):
+            return self.recent_episode_ids()
+        identity = self.latest_collection_policy_id()
+        return sorted(ep for ep, meta in self.closed.items()
+                      if identity and meta.get('collection_policy_id') == identity)
+
+    def priority_summary(self):
+        return {
+            'mode': ('latest_collection_policy' if self.sampling and self.sampling['schema_version'] in (3,4)
+                     else 'recent_episodes' if self.sampling and self.sampling['schema_version'] == 2 else 'none'),
+            'collection_policy_id': self.latest_collection_policy_id(),
+            'episode_ids': self.priority_episode_ids(),
+        }
+
+    def recent_episode_ids(self):
+        count = self.sampling.get('recent_episode_count', 0) if self.sampling else 0
+        if not count:
+            return []
+        return sorted(self.closed, key=lambda ep: (
+            self.closed[ep]['last_timestamp_ns'], self.closed[ep]['last_row_id']),
+            reverse=True)[:count]
 
     def summary(self):
         return {
             "transitions": len(self.index),
             "episodes": len(self.closed),
             "successes": sum(v["success"] for v in self.closed.values()),
+            "failures": sum(not v["success"] for v in self.closed.values()),
             "corrections": sum(x[2] for x in self.index),
             "rejected": self.rejected,
             "discarded_episodes": len(self.discarded),
             "sampling": self.sampling,
+            "training_rewards": self.rewards,
+            "recent_episode_ids": self.recent_episode_ids(),
+            "priority": self.priority_summary(),
         }
 
     def sample_indices(self, n, rng):
         """Select existing rows only; no image decode or reward relabeling.
 
         Keep the correction quota. Each remaining slot independently selects a
-        success tail or the full replay, so fractional quotas work for batch=2.
-        Success episodes are chosen uniformly, then a terminal or preceding tail
-        row is drawn. Missing success data falls back to ordinary replay.
+        episode tail or the full replay, so fractional quotas work for batch=2.
+        Within each pool, optionally mix the latest collection with the full pool.
+        Schema 4 includes successful and failed terminals with no outcome bias;
+        older schemas retain success-only tails. Missing priority entries fall
+        back to the full pool; missing eligible tails to ordinary replay.
         """
         if not isinstance(n,int) or isinstance(n,bool) or n<1:
             raise ValueError('Batch size must be a positive integer')
@@ -113,29 +207,51 @@ class Replay:
         if not self.index:
             raise ValueError("No completed contract-tagged episodes")
         corrections = [x for x in self.index if x[2]]
+        priority = set(self.priority_episode_ids())
+        fraction = (self.sampling.get('latest_collection_fraction', self.sampling.get('recent_episode_fraction', 0.))
+                    if self.sampling else 0.)
+
+        def draw(items, count, episode_key=lambda item: item[1]):
+            if not count:
+                return []
+            probabilities = None
+            if fraction > 0 and priority:
+                mask = np.array([episode_key(item) in priority for item in items])
+                if mask.any() and not mask.all():
+                    probabilities = np.full(len(items), (1-fraction)/len(items))
+                    probabilities += mask * (fraction / mask.sum())
+            indices = (rng.integers(len(items), size=count) if probabilities is None
+                       else rng.choice(len(items), size=count, p=probabilities))
+            return [items[int(i)] for i in indices]
+
         nc = int(n * self.config["correction_fraction"]) if corrections else 0
-        selected = [corrections[int(i)] for i in rng.integers(len(corrections), size=nc)] if nc else []
+        selected = draw(corrections, nc)
         tails={}
-        if self.sampling and self.sampling['success_tail_fraction']>0:
+        tail_fraction, tail_seconds, successes_only = tail_settings(self.sampling)
+        if tail_fraction>0:
             # Accepted episodes enter index in contiguous step order.
             for item in self.index:
-                if self.closed[item[1]]['success']:
+                if not successes_only or self.closed[item[1]]['success']:
                     tails.setdefault(item[1],[]).append(item)
-            window=max(1,int(np.ceil(self.sampling['success_tail_seconds']*self.config['action_hz'])))
+            window=max(1,int(np.ceil(tail_seconds*self.config['action_hz'])))
             tails={ep:items[-window:] for ep,items in tails.items()}
         if not tails:
-            selected += [self.index[int(i)] for i in rng.integers(len(self.index), size=n-nc)]
+            selected += draw(self.index, n-nc)
         else:
             episodes=list(tails)
             for _ in range(n-nc):
-                if rng.random()<self.sampling['success_tail_fraction']:
-                    tail=tails[episodes[int(rng.integers(len(episodes)))]]
-                    if len(tail)==1 or rng.random()<self.sampling['terminal_fraction_within_tail']:
+                if rng.random()<tail_fraction:
+                    tail=tails[draw(episodes, 1, episode_key=lambda ep: ep)[0]]
+                    if self.sampling['schema_version']==4:
+                        # Uniform over the entire tail, including its last frame.
+                        # No special terminal quota and no success/failure filter.
+                        selected.append(tail[int(rng.integers(len(tail)))])
+                    elif len(tail)==1 or rng.random()<self.sampling['terminal_fraction_within_tail']:
                         selected.append(tail[-1])
                     else:
                         selected.append(tail[int(rng.integers(len(tail)-1))])
                 else:
-                    selected.append(self.index[int(rng.integers(len(self.index)))])
+                    selected.extend(draw(self.index, 1))
         return selected
 
     def sample(self, n, rng):
@@ -170,11 +286,9 @@ class Replay:
                     raise ValueError("Invalid executed command")
                 # Rank only genuine human overrides of valid, different proposals.
                 corrected = bool(t[3] and proposal_valid and np.linalg.norm(action - proposal) > 1e-7)
-                reward = self.config["time_reward"]
+                reward = self.rewards["time_reward"]
                 if t[5]:
-                    reward += (
-                        self.config["success_reward"] if self.closed[ep]["success"] else self.config["failure_reward"]
-                    )
+                    reward = self.rewards['success_terminal' if self.closed[ep]['success'] else 'failure_terminal']
                 result.append(
                     {
                         "episode_id": ep,

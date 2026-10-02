@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 import sys, json
 import numpy as np
 import pytest
@@ -63,9 +64,124 @@ def test_discount_override_preserves_source_and_inherits_resumed_setting(tmp_pat
         with pytest.raises(ValueError):resolve_training_discount(c,bad)
 
 
+def test_reward_override_changes_training_only_and_preserves_terminal_mask(tmp_path):
+    from vla_precision.pipette_rl.rewards import resolve_training_rewards,check_reward_fork
+    c=config(tmp_path);before=dict(c)
+    new=dict(schema_version=1,success_terminal=10.,failure_terminal=-.01,time_reward=-.01)
+    legacy=resolve_training_rewards(c)
+    assert legacy['success_terminal']==pytest.approx(.999)
+    assert resolve_training_rewards(c,resumed_metadata={'training_rewards':new})==new
+    with pytest.raises(ValueError,match='separate'):
+        check_reward_fork(tmp_path/'old',tmp_path/'old/step-4000',legacy,new)
+    check_reward_fork(tmp_path/'new',tmp_path/'old/step-4000',legacy,new)
+    with DualReplayStore(c['replay_db']) as store:
+        store.append_online(row('success',0))
+        store.append_online(row('success',1,terminal=True,reward=1.))
+        store.append_online(row('failure',0,terminal=True))
+    replay=Replay(c,rewards=new)
+    samples=replay.sample(100,np.random.default_rng(0))
+    assert {float(round(float(s['rewards'][0]),2)) for s in samples}=={10.,-.01}
+    for s in samples:
+        assert s['rewards'][0]==pytest.approx(10. if s['dones'] and s['episode_succeed'] else -.01)
+        assert bool(s['masks'])==(not s['dones'])
+    db=replay.connect()
+    assert [r[0] for r in db.execute("SELECT reward FROM transitions WHERE buffer='online' ORDER BY id")]==[0.,1.,0.]
+    db.close()
+    assert c==before
+
+
+@pytest.mark.parametrize('value',[float('nan'),float('inf'),True,'10'])
+def test_invalid_reward_override(value):
+    from vla_precision.pipette_rl.rewards import validate_rewards
+    with pytest.raises(ValueError):
+        validate_rewards(dict(schema_version=1,success_terminal=value,failure_terminal=-.01,time_reward=-.01))
+
+
 def tail_sampling(**overrides):
     return dict(schema_version=1,success_tail_fraction=.5,success_tail_seconds=1.,
                 terminal_fraction_within_tail=.2,**overrides)
+
+
+def terminal_sampling(**overrides):
+    settings=dict(schema_version=4,terminal_tail_fraction=.5,terminal_tail_seconds=1.,
+                  latest_collection_fraction=.5)
+    settings.update(overrides)
+    return settings
+
+
+def test_all_terminal_tails_include_failure_without_outcome_or_length_bias(tmp_path):
+    c=config(tmp_path);c['correction_fraction']=0
+    with DualReplayStore(c['replay_db']) as store:
+        for ep,length in [('success',180),('failure',60)]:
+            for i in range(length):
+                store.append_online(row(ep,i,terminal=i==length-1,
+                                        reward=1. if ep=='success' and i==length-1 else 0.))
+    r=Replay(c,sampling=terminal_sampling(terminal_tail_fraction=1.,latest_collection_fraction=0.))
+    rows=r.sample_indices(20000,np.random.default_rng(42))
+    db=r.connect()
+    pos=dict(db.execute("SELECT id,step_index FROM transitions WHERE buffer='online'"));db.close()
+    assert .48<sum(ep=='failure' for _,ep,_ in rows)/len(rows)<.52
+    assert all(pos[idx]>=(150 if ep=='success' else 30) for idx,ep,_ in rows)
+    assert .025<sum(pos[idx]==(179 if ep=='success' else 59) for idx,ep,_ in rows)/len(rows)<.045
+    # Each of the 30 tail offsets, including terminal, has the same probability.
+    counts=np.bincount([(179 if ep=='success' else 59)-pos[idx] for idx,ep,_ in rows],minlength=30)
+    assert np.all((counts>550)&(counts<800))
+    # Tail oversampling changes neither rewards nor the bootstrap mask.
+    r.rewards=dict(schema_version=1,success_terminal=10.,failure_terminal=-.01,time_reward=-.01)
+    for s in r.sample(100,np.random.default_rng(3)):
+        assert s['rewards'][0]==pytest.approx(10. if s['episode_succeed'] and s['dones'] else -.01)
+        assert bool(s['masks'])==(not bool(s['dones']))
+
+
+def test_failure_only_terminal_priority_preserves_corrections_and_discard(tmp_path):
+    c=config(tmp_path)
+    with DualReplayStore(c['replay_db']) as store:
+        for i in range(90):store.append_online(row('failure',i,terminal=i==89,intervention=i<10))
+        store.append_online(row('discard',0,terminal=True));store.discard_episode('discard')
+        store.append_online(row('incomplete',0))
+        store.append_online(row('truncated',0,truncated=True))
+        store.append_online(row('foreign',0,terminal=True,contract='foreign'))
+        r=Replay(c,sampling=terminal_sampling(terminal_tail_fraction=1.))
+        rng=np.random.default_rng(1)
+        selected_tail=[]
+        for _ in range(20):
+            batch=r.sample_indices(2,rng)
+            assert batch[0][2] and batch[0][1]=='failure'
+            assert batch[1][1]=='failure' and not batch[1][2]
+            assert batch[1] in r.index[-30:]
+            selected_tail.append(batch[1][0])
+        assert len(set(selected_tail))>5
+        store.discard_episode('failure')
+        with pytest.raises(ValueError,match='No completed'):r.sample_indices(2,rng)
+
+
+def test_terminal_schema_keeps_latest_behavior_priority_and_short_episodes(tmp_path):
+    c=config(tmp_path);c['correction_fraction']=0
+    with DualReplayStore(c['replay_db']) as store:
+        store.append_online(row('old-success',0,terminal=True,reward=1.))
+        store.append_online(row('new-failure',0,terminal=True))
+    r=Replay(c,sampling=terminal_sampling(terminal_tail_fraction=1.,latest_collection_fraction=1.))
+    r.refresh()
+    # Inject identities only to isolate sampler behaviour from proposal decoding.
+    r.closed['old-success']['collection_policy_id']='acob:old'
+    r.closed['new-failure']['collection_policy_id']='acob:new'
+    assert r.priority_summary()['mode']=='latest_collection_policy'
+    assert r.priority_episode_ids()==['new-failure']
+    assert {ep for _,ep,_ in r.sample_indices(50,np.random.default_rng(1))}=={'new-failure'}
+
+
+@pytest.mark.parametrize('key,value',[('terminal_tail_fraction',1.1),('terminal_tail_seconds',0),
+                                     ('terminal_fraction_within_tail',float('nan')),('latest_collection_fraction',-1)])
+def test_invalid_terminal_sampling(key,value,tmp_path):
+    with pytest.raises(ValueError):Replay(config(tmp_path),sampling=terminal_sampling(**{key:value}))
+
+
+def test_default_sampling_is_all_outcomes_uniform_five_second_tail():
+    from vla_precision.pipette_rl.sampling import load_sampling,tail_settings
+    settings=load_sampling()
+    assert settings['schema_version']==4
+    assert tail_settings(settings)==(.5,5.,False)
+    assert 'terminal_fraction_within_tail' not in settings
 
 
 def test_success_tail_sampling_preserves_corrections_and_full_replay(tmp_path):
@@ -118,6 +234,182 @@ def test_no_success_falls_back_to_exact_legacy_sampler(tmp_path):
         for i in range(10):s.append_online(row('failure',i,terminal=i==9,intervention=i<3))
     legacy=Replay(c);new=Replay(c,sampling=tail_sampling())
     assert legacy.sample_indices(100,np.random.default_rng(1))==new.sample_indices(100,np.random.default_rng(1))
+
+
+def recent_sampling(**overrides):
+    settings=tail_sampling()
+    settings.update(schema_version=2,recent_episode_fraction=.5,recent_episode_count=2)
+    settings.update(overrides)
+    return settings
+
+
+def test_recent_mixture_in_correction_full_and_success_tail_pools(tmp_path):
+    c=config(tmp_path)
+    # Insert reverse chronological order to ensure recency uses collection time,
+    # not episode names, DB insertion order, or the order of refresh queries.
+    with DualReplayStore(c['replay_db']) as store:
+        for episode in reversed(range(10)):
+            for step in range(6):
+                t=row(str(episode),step,terminal=step==5,reward=float(step==5),intervention=step<2)
+                t=replace(t,timestamp_ns=(episode+1)*100+step)
+                store.append_online(t)
+    replay=Replay(c,sampling=recent_sampling())
+    selected=replay.sample_indices(20000,np.random.default_rng(13))
+    assert replay.recent_episode_ids()==['9','8']
+    # P(recent) = .5 + .5 * 2/10 = .6 in both halves of the batch.
+    for pool in (selected[:10000],selected[10000:]):
+        rate=sum(ep in {'9','8'} for _,ep,_ in pool)/len(pool)
+        assert .57<rate<.63
+    assert all(item[2] for item in selected[:10000])
+    assert any(ep=='0' for _,ep,_ in selected)
+    db=replay.connect()
+    positions=dict(db.execute("SELECT id,step_index FROM transitions WHERE buffer='online'"))
+    db.close()
+    # Half of non-correction slots are tails (20% terminal), half are full
+    # replay (1/6 terminal). Recency does not alter these quotas.
+    terminal=sum(positions[idx]==5 for idx,_,_ in selected[10000:])/10000
+    assert .16<terminal<.21
+
+
+def test_recent_refresh_excludes_unlabelled_and_discarded(tmp_path):
+    c=config(tmp_path)
+    settings=recent_sampling(recent_episode_count=1,recent_episode_fraction=1.)
+    with DualReplayStore(c['replay_db']) as store:
+        store.append_online(row('old',0,terminal=True,intervention=True))
+        replay=Replay(c,sampling=settings)
+        replay.refresh()
+        store.append_online(row('new',0))
+        assert {ep for _,ep,_ in replay.sample_indices(20,np.random.default_rng(0))}=={'old'}
+        store.finalize_episode('new',reward=0.)
+        samples=replay.sample_indices(20,np.random.default_rng(0))
+        assert replay.recent_episode_ids()==['new']
+        # Newest episode has no corrections: retain old correction samples.
+        assert all(ep=='old' and human for _,ep,human in samples[:10])
+        assert all(ep=='new' for _,ep,_ in samples[10:])
+        store.discard_episode('new')
+        assert {ep for _,ep,_ in replay.sample_indices(20,np.random.default_rng(0))}=={'old'}
+        assert replay.recent_episode_ids()==['old']
+
+
+def test_zero_recency_is_exact_tail_sampler(tmp_path):
+    c=config(tmp_path)
+    with DualReplayStore(c['replay_db']) as store:
+        for ep in range(3):
+            for step in range(3):
+                store.append_online(row(str(ep),step,terminal=step==2,reward=float(step==2)))
+    old=Replay(c,sampling=tail_sampling())
+    new=Replay(c,sampling=recent_sampling(recent_episode_fraction=0.))
+    assert old.sample_indices(200,np.random.default_rng(2))==new.sample_indices(200,np.random.default_rng(2))
+
+
+@pytest.mark.parametrize('key,value',[('recent_episode_fraction',1.1),('recent_episode_fraction',float('nan')),
+                                     ('recent_episode_count',0),('recent_episode_count',1.5),
+                                     ('recent_episode_count',True)])
+def test_recent_configuration_is_validated(tmp_path,key,value):
+    with pytest.raises(ValueError):Replay(config(tmp_path),sampling=recent_sampling(**{key:value}))
+
+
+def collection_sampling(**overrides):
+    settings=tail_sampling()
+    settings.update(schema_version=3,latest_collection_fraction=.5)
+    settings.update(overrides)
+    return settings
+
+
+def add_collection_episode(store, ep, time, digest, *, kind='online', foreign=False,
+                           matching_key=True, adapter_path='learner/step-00001000'):
+    from vla_policy_bridge.hil.policy_proposals import connect_writer, write_proposal
+    for step in range(3):
+        t=row(ep,step,terminal=step==2,reward=float(step==2),intervention=step==0)
+        t=replace(t,timestamp_ns=time+step)
+        t.info['policy_observation_key']=f'online:{ep}-{step}'
+        store.append_online(t)
+    if digest=='missing':
+        return
+    model=dict(source='live_inference',mode='hil_policy',checkpoint='baseline/88612',
+               acob_state_sha256=digest,acob_checkpoint=adapter_path if digest else None)
+    db=connect_writer(store.path)
+    write_proposal(db,key=f'online:{ep}-0' if matching_key else f'online:wrong-{ep}',
+                   episode=ep,step=0,contract='foreign' if foreign else 'test',kind=kind,
+                   action=np.zeros(3,np.float32),observation=b'index-test-only',model=model)
+    db.close()
+
+
+def test_collection_priority_groups_all_matching_weights_across_sessions(tmp_path):
+    c=config(tmp_path)
+    with DualReplayStore(c['replay_db']) as store:
+        # The two RL checkpoints have the same step number but different hashes.
+        # The latest hash is also present in an earlier collection session.
+        for i in range(12):
+            digest='a'*64 if i<6 else 'b'*64
+            add_collection_episode(store,str(i),100*i+1,digest,
+                                   adapter_path=f'/session-{i}/step-00001000')
+        add_collection_episode(store,'earlier-b',10,'b'*64)
+    replay=Replay(c,sampling=collection_sampling())
+    samples=replay.sample_indices(12000,np.random.default_rng(7))
+    expected={str(i) for i in range(6,12)}|{'earlier-b'}
+    assert set(replay.priority_episode_ids())==expected  # Seven, not latest five.
+    assert replay.latest_collection_policy_id()=='acob:'+'b'*64
+    # 50% priority plus 50% full replay, where the collection is 7/13.
+    for pool in (samples[:6000],samples[6000:]):
+        rate=sum(ep in expected for _,ep,_ in pool)/len(pool)
+        assert .74<rate<.80
+    assert all(human for _,_,human in samples[:6000])
+    assert any(ep=='0' for _,ep,_ in samples)
+
+
+@pytest.mark.parametrize('kwargs',[
+    {'digest':'missing'}, {'digest':'b'*64,'kind':'offline'},
+    {'digest':'b'*64,'foreign':True}, {'digest':'b'*64,'matching_key':False},
+])
+def test_unknown_latest_collection_does_not_select_an_older_policy(tmp_path,kwargs):
+    c=config(tmp_path)
+    with DualReplayStore(c['replay_db']) as store:
+        add_collection_episode(store,'old',1,'a'*64)
+        add_collection_episode(store,'new',100,**kwargs)
+    replay=Replay(c,sampling=collection_sampling())
+    samples=replay.sample_indices(2000,np.random.default_rng(2))
+    assert replay.latest_collection_policy_id() is None
+    assert replay.priority_episode_ids()==[]
+    assert .45<sum(ep=='new' for _,ep,_ in samples)/len(samples)<.55
+
+
+def test_collection_changes_on_new_policy_and_discard(tmp_path):
+    c=config(tmp_path)
+    with DualReplayStore(c['replay_db']) as store:
+        add_collection_episode(store,'bc',1,None)
+        replay=Replay(c,sampling=collection_sampling())
+        replay.refresh()
+        assert replay.latest_collection_policy_id()=='bc:test'
+        add_collection_episode(store,'rl',100,'a'*64)
+        replay.refresh()
+        assert replay.priority_episode_ids()==['rl']
+        store.discard_episode('rl')
+        replay.refresh()
+        assert replay.priority_episode_ids()==['bc']
+
+
+def test_collection_late_proposal_and_mixed_policy(tmp_path):
+    from vla_policy_bridge.hil.policy_proposals import connect_writer,write_proposal
+    c=config(tmp_path)
+    with DualReplayStore(c['replay_db']) as store:
+        add_collection_episode(store,'new',1,'missing')
+        replay=Replay(c,sampling=collection_sampling())
+        replay.refresh()
+        assert replay.priority_episode_ids()==[]
+        db=connect_writer(store.path)
+        for step,digest in [(0,'a'*64),(1,'b'*64)]:
+            write_proposal(db,key=f'online:new-{step}',episode='new',step=step,contract='test',kind='online',
+                           action=np.zeros(3,np.float32),observation=b'index-test-only',
+                           model=dict(source='live_inference',mode='hil_policy',acob_state_sha256=digest))
+            replay.refresh()
+            assert replay.priority_episode_ids()==(['new'] if step==0 else [])
+        db.close()
+
+
+@pytest.mark.parametrize('value',[-.1,1.1,float('nan'),True])
+def test_collection_fraction_validation(tmp_path,value):
+    with pytest.raises(ValueError):Replay(config(tmp_path),sampling=collection_sampling(latest_collection_fraction=value))
 
 
 @pytest.mark.parametrize('key,value',[('success_tail_fraction',1.1),('success_tail_seconds',0),

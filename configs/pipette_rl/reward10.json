@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "success_terminal": 10.0,
+  "failure_terminal": -0.01,
+  "time_reward": -0.01
+}

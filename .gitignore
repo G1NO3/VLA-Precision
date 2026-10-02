@@ -3,6 +3,9 @@
 /tests/*
 !/tests/test_pipette_preview.py
 !/tests/test_pipette_rl.py
+!/tests/test_pipette_rl_metrics.py
+!/tests/test_correction_data.py
+!/tests/test_pipette_rlt.py
 .ruff_cache/
 __pycache__/
 *.py[cod]

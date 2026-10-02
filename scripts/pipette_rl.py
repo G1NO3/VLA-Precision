@@ -6,7 +6,8 @@ from pathlib import Path
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 from vla_precision.pipette_rl.config import load_config, DEFAULT_CONFIG, WORKSPACE, resolve_training_discount, check_discount_fork
-from vla_precision.pipette_rl.sampling import load_sampling, DEFAULT_SAMPLING_CONFIG
+from vla_precision.pipette_rl.sampling import load_sampling, DEFAULT_SAMPLING_CONFIG, tail_settings
+from vla_precision.pipette_rl.rewards import load_rewards, resolve_training_rewards, check_reward_fork
 
 
 def policy_processes():
@@ -29,11 +30,13 @@ def main():
     p.add_argument("mode", choices=["check", "train", "smoke"])
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     p.add_argument("--sampling-config", type=Path, default=DEFAULT_SAMPLING_CONFIG,
-                   help="Learner-only success-tail sampling configuration; leaves replay contract unchanged")
+                   help="Learner-only terminal-tail/collection-policy sampling; leaves replay contract unchanged")
     p.add_argument("--uniform-replay", action="store_true",
                    help="Use legacy correction + uniform replay sampling")
     p.add_argument("--discount", type=float,
                    help="Learner discount override; changed discount requires a separate output when resuming")
+    p.add_argument("--reward-config",type=Path,
+                   help="Learner-only terminal/time rewards; inherited on resume if omitted")
     p.add_argument("--source-contract", type=Path, help="Collector source-contract.json; permit only runtime path relocation")
     p.add_argument("--replay-db", type=Path, help="Immutable replay snapshot from collector")
     p.add_argument("--max-updates", type=int, default=1000)
@@ -45,9 +48,10 @@ def main():
     args = p.parse_args()
     c = load_config(args.config, source_contract=args.source_contract, replay_db=args.replay_db)
     discount=resolve_training_discount(c,args.discount)
+    requested_rewards=load_rewards(args.reward_config) if args.reward_config else None
     from vla_precision.pipette_rl.replay import Replay
 
-    replay = Replay(c, sampling=None if args.uniform_replay else load_sampling(args.sampling_config))
+    replay = Replay(c, sampling=None if args.uniform_replay else load_sampling(args.sampling_config),rewards=requested_rewards)
     replay.refresh()
     if args.mode == "check":
         print(json.dumps({"contract": c, "learner_discount":discount, "replay": replay.summary(), "robot_output": False}, indent=2))
@@ -93,6 +97,9 @@ def main():
         previous_discount=resolve_training_discount(c,resumed_metadata=metadata)
         discount=resolve_training_discount(c,args.discount,metadata)
         check_discount_fork(output,args.resume,previous_discount,discount)
+        previous_rewards=resolve_training_rewards(c,resumed_metadata=metadata)
+        replay.rewards=resolve_training_rewards(c,requested_rewards,metadata)
+        check_reward_fork(output,args.resume,previous_rewards,replay.rewards)
         if metadata.get("smoke_only"):
             raise ValueError("A smoke checkpoint cannot initialize a real RL run")
         if "training_episode_ids" not in metadata:
@@ -103,6 +110,7 @@ def main():
         if set(metadata["training_episode_ids"]) - replay.closed.keys():
             raise ValueError("Replay snapshot lacks valid training history; use a cumulative snapshot")
     status("loading", baseline=c["baseline"], discount=discount, sampling=replay.sampling,
+           training_rewards=replay.rewards,
            parent_checkpoint=str(args.resume) if args.resume else None)
     import jax
     from vla_precision.pipette_rl.model import (
@@ -208,6 +216,7 @@ def main():
             return
         check_discarded()
         rows = replay.sample(c["batch_size"], rng)
+        priority_at_sample = set(replay.priority_episode_ids())
         batch = make_batch(rows, cache)
         # Detect revocations during image/VLM encoding before applying updates.
         check_discarded()
@@ -225,9 +234,18 @@ def main():
         scalars = {k: float(np.asarray(v)) for k, v in metrics.items() if np.asarray(v).ndim == 0}
         scalars.update(
             discount=discount,
+            reward_success_terminal=replay.rewards['success_terminal'],
+            reward_failure_terminal=replay.rewards['failure_terminal'],
+            reward_time=replay.rewards['time_reward'],
+            sampled_priority_episode_count=sum(r['episode_id'] in priority_at_sample for r in rows),
+            replay_priority_episode_pool_size=len(priority_at_sample),
             sampled_success_terminal_count=sum(bool(r['episode_succeed'] and r['dones']) for r in rows),
+            sampled_failure_terminal_count=sum(bool(not r['episode_succeed'] and r['dones']) for r in rows),
+            sampled_terminal_count=sum(bool(r['dones']) for r in rows),
+            sampled_terminal_tail_count=sum(bool(r['steps_to_terminal']<
+                tail_settings(replay.sampling)[1]*c['action_hz']) for r in rows),
             sampled_success_tail_count=sum(bool(r['episode_succeed'] and r['steps_to_terminal']<
-                (replay.sampling['success_tail_seconds']*c['action_hz'] if replay.sampling else 0)) for r in rows),
+                tail_settings(replay.sampling)[1]*c['action_hz']) for r in rows),
             sampled_steps_to_terminal_mean=float(np.mean([r['steps_to_terminal'] for r in rows])),
         )
         if not all(np.isfinite(v) for v in scalars.values()):
@@ -240,12 +258,19 @@ def main():
             check_discarded()
             path = save_checkpoint(agent, c, step, output / f"step-{step:08d}",
                                    training_episode_ids=used_episodes, replay_sampling=replay.sampling,
+                                   replay_priority=replay.priority_summary(),
+                                   training_rewards=replay.rewards,
                                    parent_checkpoint=args.resume)
             check_discarded()
             tmp = output / "latest.json.tmp"
             tmp.write_text(json.dumps({"checkpoint": str(path), "step": step}))
             tmp.replace(output / "latest.json")
-    status("completed", step=step, discount=discount,sampling=replay.sampling)
+    status("completed", step=step, discount=discount,sampling=replay.sampling,training_rewards=replay.rewards)
+    # Publish only after the whole requested training round completes. A partial
+    # checkpoint remains resumable but does not change the next deployed policy.
+    from gui.pi05_checkpoints import publish_completed_policy
+    published = publish_completed_policy(output)
+    print(json.dumps({'policy_checkpoint_published': published, 'robot_output': False}), flush=True)
 
 
 if __name__ == "__main__":

@@ -71,7 +71,8 @@ def trainable(agent):
     return agent.state.pi_state.params.filter(agent.pi_train_config.trainable_filter)
 
 
-def save_checkpoint(agent, config, step, path, *, training_episode_ids=None, replay_sampling=None, parent_checkpoint=None):
+def save_checkpoint(agent, config, step, path, *, training_episode_ids=None, replay_sampling=None,
+                    replay_priority=None, training_rewards=None, parent_checkpoint=None):
     """Atomic portable LoRA + critic + optimizer snapshot; no frozen 3B duplication."""
     import jax
     from flax import serialization
@@ -107,6 +108,9 @@ def save_checkpoint(agent, config, step, path, *, training_episode_ids=None, rep
     if training_episode_ids is not None:
         meta["training_episode_ids"] = sorted(training_episode_ids)
     meta["replay_sampling"] = replay_sampling
+    meta["replay_priority"] = replay_priority
+    from .rewards import resolve_training_rewards
+    meta["training_rewards"] = resolve_training_rewards(config,training_rewards)
     (path / "metadata.json").write_text(json.dumps(meta, indent=2))
     (path / "READY").write_text("complete\n")
     return path
