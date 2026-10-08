@@ -59,6 +59,8 @@ G1 双手移液五阶段任务的原生 π0.5 JAX 数据准备、配置、验证
 
 从新服务器开始安装、下载、预检、短训练、五阶段正式训练及备份，请按[远程服务器完整操作指南](docs/PI05_FULLTASK_REMOTE_TRAINING_ZH.md)执行。
 
+五阶段 GR00T N1.7 的 RLToken 准备、与 `jm_pipette` 一致的奖励、独立 GUI 顺序采集入口和有限轮次 learner，见 [GR00T RLToken 配置与操作流程](docs/GR00T_FULLTASK_RLT_ZH.md)。P1 token/BC 已训练；真实接管与闭环仍待硬件验收。离线入口不隐式启动机器人，在线采集须显式选择新 RLToken lane。
+
 配置文件：
 
 ```text

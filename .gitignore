@@ -7,6 +7,9 @@
 !/tests/test_correction_data.py
 !/tests/test_pipette_rlt.py
 !/tests/test_pipette_fulltask.py
+!/tests/test_gr00t_rlt.py
+!/tests/test_gr00t_rlt_v2.py
+!/tests/test_gr00t_rlt_live.py
 .ruff_cache/
 __pycache__/
 *.py[cod]

@@ -74,7 +74,7 @@ def validate_recording_split(provenance, phase_by_episode):
 
 
 class FullTaskDataset:
-    def __init__(self, root, action_horizon=30, *, split="train"):
+    def __init__(self, root, action_horizon=30, *, split="train", left_thumb_relative=None):
         self.root = Path(root).resolve()
         self.manifest = json.loads((self.root / "manifest.json").read_text())
         if self.manifest["format"] != FORMAT or action_horizon != 30:
@@ -82,6 +82,11 @@ class FullTaskDataset:
         if split not in ("train", "validation"):
             raise ValueError(split)
         self.phase = int(self.manifest["phase"])
+        # None preserves the legacy per-phase recipe; GR00T five-task v2
+        # explicitly requests relative thumb labels in ALL phases, including P1.
+        if left_thumb_relative is not None and not isinstance(left_thumb_relative, bool):
+            raise ValueError("left_thumb_relative must be boolean or None")
+        self.left_thumb_relative = self.phase != 1 if left_thumb_relative is None else left_thumb_relative
         self.split = split
         self.action_horizon = action_horizon
         self.shared = (self.root / self.manifest["shared_root"]).resolve()
@@ -109,7 +114,7 @@ class FullTaskDataset:
         data = self.episodes[ep]
         return {"state": data["state"][frame].copy(),
                 "actions": action_chunk(data["commands"], frame, self.action_horizon,
-                                        left_thumb_relative=self.phase != 1)}
+                                        left_thumb_relative=self.left_thumb_relative)}
 
     @lru_cache(maxsize=8)
     def _cached_video(self, ep, view):

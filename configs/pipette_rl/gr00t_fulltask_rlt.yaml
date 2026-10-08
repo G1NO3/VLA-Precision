@@ -1,0 +1,88 @@
+schema: gr00t_fulltask_rlt.v1
+# Paths resolve against the workspace containing VLA-Precision, not the shell cwd.
+models_root: models
+prepared_root: datasets/g1-pipette-fulltask-jax-v1
+output_root: outputs/gr00t-fulltask-rlt
+starvla_root: starVLA
+rlinf_root: RLinf
+starvla_commit: 217eeb95bd359e31254e1c09ddfb04216711ec26
+rlinf_commit: c9e80673265b88a3eaf97d8dd3726d081ad3a889
+seed: 42
+state_dim: 59
+model_action_dim: 32
+actor_action_dim: 18
+horizon: 30
+views: [rgb, wrist_left]
+unnorm_key: new_embodiment
+feature_layer: 16
+reference_seed: 42
+# Stage 2 updates the small actor/critics, NOT GR00T's backbone/DiT.
+freeze_gr00t: true
+freeze_token_during_rl: true
+joint_seed_policy: frozen_reference
+# No live executor until the bimanual intervention/safety contract is agreed.
+live_enabled: false
+execution_contract: sequential_chunk_no_ensemble_v1
+reward:
+  source: jm_pipette/runs/qwenoft_ac/config.json
+  source_bridge_commit: ac8e7cd9b8003d574d5ea95b675c5733719fb9d3
+  clock: monotonic_elapsed
+  rate_hz: 60
+  gamma: 0.999499874937461
+  step_penalty: -0.005
+  success_reward: 10.0
+  failure_reward: 0.0
+  terminal_replaces_last_tick: true
+  outcome_scope: phase_episode
+token:
+  input_dim: 2048
+  embed_dim: 256
+  prefix_seq_len: 1024
+  num_layers: 2
+  num_heads: 8
+  mlp_ratio: 4.0
+  lr: 0.0001
+  batch_size: 4
+  updates: 2000
+learner:
+  bc_updates: 2000
+  actor_lr: 0.0001
+  critic_lr: 0.0003
+  batch_size: 128
+  updates: 600
+  critic_warmup_steps: 20
+  actor_update_interval: 2
+  q_weight: 0.1
+  human_bc_weight: 1.0
+  reference_weight: 1.0
+  reference_dropout: 0.5
+  target_tau: 0.005
+  target_noise: 0.01
+  target_noise_clip: 0.03
+  max_grad_norm: 1.0
+phases:
+  p1:
+    repo: jren313/starvla-pipette-pick-r3
+    revision: 213a7275e41c89290c1f7fa92dc87a65f4f673b9
+    step: 2000
+    left_thumb: absolute
+  p2:
+    repo: jren313/starvla-pipette-tube-pick-r2
+    revision: 856f33e3e70aa289b4480f0deee054acdaa81445
+    step: 1000
+    left_thumb: chunk_relative
+  p3:
+    repo: jren313/starvla-pipette-aim-r1
+    revision: efe3ee345fe44bb80da44b8dd25e0608a1b3e427
+    step: 1350
+    left_thumb: chunk_relative
+  p4:
+    repo: jren313/starvla-pipette-tube-return-r1
+    revision: c3b93b1a2753231fe1df2ceef1f71b078a6034e0
+    step: 500
+    left_thumb: chunk_relative
+  p5:
+    repo: jren313/starvla-pipette-return-r1
+    revision: c37e7a281808f4e7493d0ec6f3eb1bd3ef99164d
+    step: 3000
+    left_thumb: chunk_relative
