@@ -10,6 +10,13 @@
 !/tests/test_gr00t_rlt.py
 !/tests/test_gr00t_rlt_v2.py
 !/tests/test_gr00t_rlt_live.py
+!/tests/test_pi05_rlt.py
+!/tests/test_focus_bootstrap.py
+!/tests/test_direct_editor.py
+!/tests/test_async_replay.py
+!/tests/test_focus_diagnostics.py
+!/tests/test_capture_performance.py
+!/tests/test_continuous_editor.py
 .ruff_cache/
 __pycache__/
 *.py[cod]

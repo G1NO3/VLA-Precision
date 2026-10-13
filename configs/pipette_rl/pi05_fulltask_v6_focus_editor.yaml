@@ -1,0 +1,82 @@
+schema: pi05_fulltask_editor.v2
+models_root: models
+prepared_root: datasets/g1-pipette-fulltask-focus-bootstrap
+output_root: outputs/pi05-fulltask-v6-focus-editor-act
+starvla_root: starVLA
+rlinf_root: RLinf
+starvla_commit: de0a9a3bade4eb57d3ec53a82416aaa198dcb68b
+rlinf_commit: c9e80673265b88a3eaf97d8dd3726d081ad3a889
+seed: 42
+state_dim: 59
+model_action_dim: 32
+actor_action_dim: 18
+horizon: 30
+views: [rgb, focus]
+image_source: raw_video
+unnorm_key: new_embodiment
+feature_layer: prefix_final
+reference_seed: 42
+focus:
+  enabled: true
+  sam: small
+  mode: causal_background_stream
+  rate_hz: 10.0
+freeze_backbone: true
+freeze_token_during_rl: true
+joint_seed_policy: frozen_reference
+live_enabled: false
+execution_contract: async_act_proposal_v1
+scheduler:
+  context_dim: 14002
+  inference_hz: 5
+  action_hz: 60
+  mode: act
+  decay: 0.01
+  handoff: latency
+reward:
+  source: jm_pipette/runs/qwenoft_ac/config.json
+  source_bridge_commit: ac8e7cd9b8003d574d5ea95b675c5733719fb9d3
+  clock: monotonic_elapsed
+  rate_hz: 60
+  gamma: 0.999499874937461
+  step_penalty: -0.005
+  success_reward: 10.0
+  failure_reward: 0.0
+  terminal_replaces_last_tick: true
+  outcome_scope: phase_episode
+editor:
+  features: pi05_two_view_spatial_2x2_v1
+  residual_scale: 0.2
+# Legacy storage dimensions only; no token network is constructed.
+token:
+  input_dim: 2048
+  embed_dim: 16384
+  prefix_seq_len: 1024
+learner:
+  actor_lr: 0.0001
+  critic_lr: 0.0003
+  batch_size: 128
+  updates: 600
+  critic_warmup_steps: 20
+  actor_update_interval: 2
+  q_weight: 0.1
+  human_bc_weight: 1.0
+  reference_weight: 1.0
+  reference_dropout: 0.0
+  target_tau: 0.005
+  target_noise: 0.01
+  target_noise_clip: 0.03
+  max_grad_norm: 1.0
+baseline:
+  repo: jren313/starvla-pipette-5task-v6-pi05-egofocus
+  revision: 2fec01a2e31e93c3630aefaf9ed80bf711e331f3
+  step: 21600
+  state_input: false
+  left_thumb: chunk_relative
+  weights_sha256: dac953fbe6e489858869ee86444cf5e324a9ab04d3f278aa36c5bc34174a39d8
+phases:
+  p1: {held_action_indices: [12, 17]}
+  p2: {held_action_indices: [13, 14, 15, 16, 17]}
+  p3: {held_action_indices: [12, 13, 14, 15, 16, 17]}
+  p4: {held_action_indices: [13, 14, 15, 16, 17]}
+  p5: {held_action_indices: [12, 17]}

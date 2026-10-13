@@ -1,5 +1,67 @@
 # GR00T 五阶段 RLToken 配置与接管边界
 
+## 2026-10-13：rollout 尾延迟与后台 replay
+
+Direct Editor 的 SQLite replay 现在由 `AsyncReplay` 的单 worker 串行写入：32 项有界队列、
+入队快照、压缩/数据库提交不占 bridge 控制锁。`begin/append/phase_success/event/finish/discard`
+顺序保持不变，仍用 WAL + synchronous=FULL。GUI counts 是已提交数量，不是已排队的操作数。
+终止后先暂停，待 writer pending=0 且无 error 才放开训练锁；GUI 同样阻止提前启动 learner。
+错误锁定后不允许继续采集；待提交的成功不能跳过失败 transition。正常退出排空，异常退出
+保留 SQLite 恢复规则及 observation receipt/hash 校验；不自动删除原始数据。
+
+Bridge 的 `[rollout health]` / GUI 提供最近 60 秒的 P50/P95/P99/max、margin 的 min/P01，
+覆盖 RPC、IK、整轮、请求/安装间隔、安装延迟、有效剩余 horizon、控制循环周期和空队列时长。
+共享 RL 的外层发布回调也已接回 Bridge 的暂停握手，避免继承覆盖绕过 post-DDS hold 确认。
+详细按键/验收见 `../VLAPolicyBridge/gui/README.md` 的同日章节。
+
+FOCUS 诊断通过 starVLA 的 `FocusTiming` 跟踪 detection/tracking 的 host-wall-time 区间，
+在每次模型请求记录 overlap、GPU 锁等待、target/generation、using_prior 和记录年龄。
+这些信息写入 `[rlt timing]`、GUI 与 replay 的 `focus_diagnostics_json`；旧 starVLA 缺少接口时
+明确标记 available=false。不是 CUDA kernel profiler，且不改变检测调度或 crop 像素。
+本次不改模型、10 步去噪、60/5 Hz 配方或动作分布。隔离测试通过不等于真机延迟已经达标。
+
+## 2026-10-13：Direct Editor 推理关键路径优化
+
+- 观测归档使用单线程后台 writer，最多 8 个 pending 请求；CPU buffer 独立拷贝，
+  不保留 CUDA tensor。使用无压缩 NPZ，文件/目录 fsync 和 SHA256 不阻塞动作响应。
+  原压缩在真实 6.9 MB 样本的隔离 CPU 基准约 235 ms，仅搬到后台仍可能积压。
+  无压缩空间开销约 35 MB/s（5 Hz），保留 2 GiB 空闲空间保护；不自动删除数据。
+- action metadata 使用 `observation_receipt` 关联异步归档。只有 NPZ 与带哈希 receipt
+  都已提交且 state/reference 对齐，replay 才允许导出训练。队列满、磁盘失败会报错；
+  强制终止可能留下不可训练的 pending 文件，不伪造成功，不自动清除原始数据。
+- actor 复用 GPU prefix（保留原 float16 量化语义）；CPU 副本用于归档，取消整块
+  prefix 的 CPU→GPU 回传。没有额外 VLM forward，也不改变权重和动作分布。
+- 服务输出 `[rlt timing]`：预处理、模型 predict、特征 CPU 拷贝、FOCUS 锁等待、
+  actor、打包、归档入队和服务总耗时。bridge 输出 `[editor timing]` 与 flight
+  `editor_performance`：RPC、请求到安装、剩余有效动作时长、replay flush；GUI 同步显示。
+- 保留 10 步 flow sampler、ACT latency handoff 和过期保护。尚需真实 GPU 计时确认
+  是否达到连续覆盖；这项变更不修复 B 暂停后底层继续追赶旧 reference 的独立问题。
+
+CPU 隔离回归：在 `VLAPolicyBridge` 下使用 `scripts/test_isolated.sh`，设置
+`PB_TEST_PYTHON` 为 VLA-Precision 的 Python、`PYTHONPATH` 包含其 src 和 bridge，
+运行 `../VLA-Precision/tests/test_capture_performance.py`。禁止普通 pytest 接触现场控制文件。
+
+## 2026-10-12 最新补充：FOCUS pi0.5 连续任务共享 Editor
+
+本文下方 GR00T/RLToken 和每阶段独立 learner 是历史/并存路线，不是当前 GUI Editor 默认。
+当前实现是 [pi05_fulltask_v6_focus_continuous.yaml](../configs/pipette_rl/pi05_fulltask_v6_focus_continuous.yaml)，
+schema `pi05_fulltask_editor.v3`：冻结同一份 FOCUS v6，共享 phase-conditioned actor/twin critic、
+target/optimizer 和 replay。phase one-hot 输入两个网络，手指 mask 按 phase 动态应用。
+
+- Unitree R1+A：P1–P4 每次 +1，换指令/phase 后继续；P5 +11，结束整任务并暂停。
+- R1+X：立即请求保持并标记整条轨迹 failure；F1：保持并丢弃整条轨迹。
+- X 显式播放/继续，B 暂停同一 episode。阶段切换不 reset 姿态、不重启服务、不换权重。
+- 一条 episode 从 P1 串到 P5；中间阶段有真实 next observation 和 next phase，保留 bootstrap。
+- 暂时关闭原 −0.3/秒时间惩罚，保留 elapsed-time discount；未折扣事件奖励总和为 15。
+- 新 replay 在 `runs/pi05_v6_focus_editor_continuous`；共享 learner 输出在
+  `outputs/pi05-fulltask-v6-focus-editor-continuous/shared/learner`。旧数据和权重完整保留，不能直接混用。
+- 按已有阶段均衡采样，无 demo rehearsal；旧 loss 全部保留，并记录每个 batch 的 phase 数量。
+- actor 版本在整条轨迹内固定（包括 B/X），只在新轨迹加载新发布权重；learner 仍在轨迹结束后有限轮次更新。
+
+按键互斥、discard、恢复、GUI 路径和真机验收顺序见
+[GUI 文档“当前默认：连续五阶段奖励与共享网络”](../../VLAPolicyBridge/gui/README.md#当前默认连续五阶段奖励与共享网络editorv3)。
+新流程尚需现场运动验收；不会把 CPU 预检或假机器人测试宣称为真机验证。
+
 当前默认配置使用 GUI 已部署的 **单个五任务 GR00T v2 checkpoint**，沿用 `jm_pipette` 当前 QwenOFT actor-critic 的奖励。五阶段共用冻结 GR00T，但初期各自训练 token/actor/critic，用户已选择先做 P1（拿移液枪）。`gr00t_rlt.py` 是纯离线准备/训练入口；新增 `gr00t_rlt_live.py` 提供模型服务、SQLite 导出和有限轮次训练，GUI 的独立 RLToken lane 使用顺序 collector。实现已通过离线测试，**尚未进行真机闭环验收**。
 
 默认配置位于 [gr00t_fulltask_v2_rlt.yaml](../configs/pipette_rl/gr00t_fulltask_v2_rlt.yaml)，入口是 [gr00t_rlt.py](../scripts/gr00t_rlt.py)。旧五 checkpoint 配方保留在 [gr00t_fulltask_rlt.yaml](../configs/pipette_rl/gr00t_fulltask_rlt.yaml)，必须显式用 `--config configs/pipette_rl/gr00t_fulltask_rlt.yaml` 选择；不会自动下载旧模型。代码保存在 `VLA-Precision` 的 `jy-full-gr00t` 分支工作区；没有修改另一个 `jm_pipette` 实验，也没有切换 starVLA、Bridge 或 RLinf 分支。
@@ -7,6 +69,16 @@
 P1 token 和 BC 权重已训练并通过实际 GR00T GPU 服务推理检查；P2–P5 尚未训练各自初始权重。PICO 相对双腕接管为独立可选输入，硬件标定仍需操作员验收。配置保留 `live_enabled: false`，表示离线工具不隐式启动机器人；改为 true 仍报错。在线功能通过新服务和 Bridge 的显式 `--rlt_run` 参数启用，不以该标志代替安全验收。
 
 ## 模型与下载位置
+
+2026-10-12 pi0.5 扩展与路线决策：已新增独立配方
+[pi05_fulltask_v5_rlt.yaml](../configs/pipette_rl/pi05_fulltask_v5_rlt.yaml)。当前先推进
+starVLA pi0.5 v5 的 **RLToken + 小 actor–critic**，理由是在线更新的工程/计算成本较低，
+不是已经证明其真机成功率优于直接微调。pi0.5 专用 token/BC 尚未训练；上文 GR00T P1 的
+已训练/推理检查状态不能套用到 pi0.5。
+同时保留“冻结 VLM，直接通过 Q 梯度微调原 pi0.5 flow action expert”为尚未实现的算法备选；
+它不需要动作概率，主要新增计算难点是多步 flow 的反向传播，仍需新 critic、warmup 和归因校验。
+完整取舍、loss 定义、后续 benchmark 与当前 RLToken 操作流程见
+[GUI 中文说明的「算法备选与路线决策」](../../VLAPolicyBridge/gui/README.md)。本次只记录决策，不切换训练路线。
 
 2026-10-08 发布说明：四个相关仓库统一发布到各自的 `jy-full-gr00t` 分支。starVLA 的 `2c52f5f10fe232bd875bd0bdad8454775154bd58` 只将此前训练/推理已经使用的五任务 dataset registry 补丁提交；模型计算代码未变。版本检查精确兼容这个提交及配方原始基线 `217eeb95bd359e31254e1c09ddfb04216711ec26`，不放行任意后续提交。保留原配方 contract hash，因此现有 P1 token/BC/cache 无需重写或重训。模型权重、数据集及 replay 不通过 Git 推送。
 

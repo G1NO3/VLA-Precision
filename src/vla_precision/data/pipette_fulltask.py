@@ -74,7 +74,7 @@ def validate_recording_split(provenance, phase_by_episode):
 
 
 class FullTaskDataset:
-    def __init__(self, root, action_horizon=30, *, split="train", left_thumb_relative=None):
+    def __init__(self, root, action_horizon=30, *, split="train", left_thumb_relative=None, raw_images=False):
         self.root = Path(root).resolve()
         self.manifest = json.loads((self.root / "manifest.json").read_text())
         if self.manifest["format"] != FORMAT or action_horizon != 30:
@@ -88,6 +88,7 @@ class FullTaskDataset:
             raise ValueError("left_thumb_relative must be boolean or None")
         self.left_thumb_relative = self.phase != 1 if left_thumb_relative is None else left_thumb_relative
         self.split = split
+        self.raw_images = raw_images
         self.action_horizon = action_horizon
         self.shared = (self.root / self.manifest["shared_root"]).resolve()
         self.source = Path(self.manifest["source"])
@@ -122,7 +123,9 @@ class FullTaskDataset:
         return np.load(path, mmap_mode="r") if path.is_file() else None
 
     def image(self, ep, frame, view):
-        cached = self._cached_video(ep, view)
+        # PI05 must use its own production square-224 transform on original
+        # pixels, not the GR00T-specific resize270 cache / double resampling.
+        cached = None if self.raw_images else self._cached_video(ep, view)
         if cached is not None:
             return np.asarray(cached[frame])
         # Slow but bounded-memory diagnostic fallback; training should cache images.
@@ -135,7 +138,10 @@ class FullTaskDataset:
             ok, bgr = cap.read()
             if not ok:
                 raise FileNotFoundError(f"Cannot decode {path}, frame {frame}")
-            return np.asarray(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).resize((270, 270), Image.Resampling.BILINEAR))
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            if self.raw_images:
+                return rgb
+            return np.asarray(Image.fromarray(rgb).resize((270, 270), Image.Resampling.BILINEAR))
         finally:
             cap.release()
 

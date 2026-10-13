@@ -7,9 +7,12 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from .core import is_editor, is_async_editor, is_shared, phase_active
 
 
 def token_model(c):
+    if is_editor(c):
+        raise ValueError("Direct editor uses fixed spatial pooling, not a learned token/autoencoder")
     path = Path(c["rlinf_root"]) / "rlinf/models/embodiment/modules/rlt_token_transformer.py"
     spec = importlib.util.spec_from_file_location("gr00t_upstream_rlt_token", path)
     module = importlib.util.module_from_spec(spec)
@@ -40,17 +43,109 @@ class Heads(nn.Module):
         qdim = state_dim + self.h * (self.full - self.d) + 2 * self.h * self.d
         self.critics = nn.ModuleList([mlp(qdim, 1), mlp(qdim, 1)])
 
-    def act(self, z, state, reference, *, dropout=0.0):
+    def act(self, z, state, reference, *, dropout=0.0, phase=None):
         ref = reference
         if dropout:
             ref = ref * (torch.rand((len(ref), 1, 1), device=ref.device) >= dropout)
         result = self.actor(torch.cat([z, state, ref.flatten(1)], -1)).reshape(-1, self.h, self.d).clamp(-2.2, 2.2)
         return torch.where(self.active, result, reference[..., :self.d])
 
-    def q(self, z, state, reference, action, valid):
+    def q(self, z, state, reference, action, valid, context=None, *, phase=None):
         x = torch.cat([z, state, reference[..., self.d:].flatten(1),
                        (action * valid).flatten(1), valid.float().flatten(1)], -1)
         return torch.cat([net(x) for net in self.critics], -1)
+
+    def active_for(self, phase=None):
+        return self.active
+
+    def smooth_action(self, action, reference, noise, *, phase=None):
+        return torch.where(self.active, (action + noise).clamp(-2.2, 2.2), action)
+
+
+def spatial_features(prefix, mask):
+    """Pinned PI05 prefix: ego256, focus256, masked dummy256, language.
+
+    Each 224px SigLIP image is a row-major 16x16 grid. Pool each quadrant
+    separately; do not average cameras or include padding/language as pixels.
+    Prefix features are frozen, though contextualized by the language tokens.
+    """
+    if (prefix.ndim != 3 or prefix.shape[-1] != 2048 or prefix.shape[1] < 768
+            or mask.shape != prefix.shape[:2] or mask.dtype != torch.bool):
+        raise ValueError("Unexpected PI05 image-prefix layout")
+    if not mask[:, :512].all() or mask[:, 512:768].any():
+        raise ValueError("Editor requires two real views and a masked third view")
+    grid = prefix[:, :512].detach().float().reshape(-1, 2, 2, 8, 2, 8, 2048)
+    result = grid.mean(dim=(3, 5)).flatten(1)
+    if not torch.isfinite(result).all():
+        raise ValueError("Non-finite editor visual features")
+    return result
+
+
+class ContextCritic(nn.Module):
+    def __init__(self, inputs, context_dim):
+        super().__init__()
+        self.context_dim = context_dim
+        self.context_encoder = nn.Sequential(nn.LayerNorm(context_dim), nn.Linear(context_dim, 64), nn.SiLU())
+        self.net = mlp(inputs + 64, 1)
+
+    def forward(self, x, context):
+        if context is None or context.shape != (len(x), self.context_dim):
+            raise ValueError("Critic requires observation-time ACT scheduler context")
+        return self.net(torch.cat([x, self.context_encoder(context)], -1))
+
+
+class EditorHeads(Heads):
+    """Zero-initialized, bounded action editor of the frozen reference chunk."""
+    def __init__(self, c):
+        super().__init__(c)
+        self.shared = is_shared(c)
+        self.phase_dim = 5 if self.shared else 0
+        if self.shared:
+            self.actor = mlp(c["token"]["embed_dim"] + c["state_dim"] + self.h*self.full + 5, self.h*self.d)
+            self.register_buffer("phase_masks", torch.tensor([phase_active(c, f"p{i+1}") for i in range(5)], dtype=torch.bool))
+        self.scale = float(c["editor"]["residual_scale"])
+        nn.init.zeros_(self.actor[-1].weight)
+        nn.init.zeros_(self.actor[-1].bias)
+        qdim = c["token"]["embed_dim"] + c["state_dim"] + self.h * (self.full + 2*self.d) + self.phase_dim
+        self.context_dim = c["scheduler"]["context_dim"] if is_async_editor(c) else 0
+        self.critics = nn.ModuleList([ContextCritic(qdim, self.context_dim) if self.context_dim else mlp(qdim, 1)
+                                     for _ in range(2)])
+
+    def _phase_features(self, phase, z):
+        if not self.shared:
+            return z
+        self.active_for(phase)  # validate before indexing/one-hot
+        if phase.shape != (len(z),):
+            raise ValueError("Phase batch differs from observations")
+        return torch.cat([z, torch.nn.functional.one_hot(phase.long(), 5).to(z)], -1)
+
+    def active_for(self, phase=None):
+        if not self.shared:
+            return self.active
+        if (phase is None or phase.ndim != 1 or not torch.isfinite(phase).all()
+                or not ((phase >= 0) & (phase < 5) & (phase == phase.long())).all()):
+            raise ValueError("Shared editor requires integer phase labels 0..4")
+        return self.phase_masks[phase.long()][:, None, :]
+
+    def act(self, z, state, reference, *, dropout=0.0, phase=None):
+        if dropout:
+            raise ValueError("Editor cannot drop its reference action")
+        delta = self.scale * self.actor(torch.cat([self._phase_features(phase, z), state, reference.flatten(1)], -1)).tanh()
+        delta = delta.reshape(-1, self.h, self.d)
+        return reference[..., :self.d] + torch.where(self.active_for(phase), delta, torch.zeros_like(delta))
+
+    def q(self, z, state, reference, action, valid, context=None, *, phase=None):
+        x = torch.cat([self._phase_features(phase, z), state, reference.flatten(1), (action*valid).flatten(1), valid.float().flatten(1)], -1)
+        return torch.cat([net(x, context) if self.context_dim else net(x) for net in self.critics], -1)
+
+    def smooth_action(self, action, reference, noise, *, phase=None):
+        ref = reference[..., :self.d]
+        delta = (action + noise - ref).clamp(-self.scale, self.scale)
+        return ref + torch.where(self.active_for(phase), delta, torch.zeros_like(delta))
+
+
+def make_heads(c):
+    return EditorHeads(c) if is_editor(c) else Heads(c)
 
 
 def supervised_losses(prediction, action, reference, human, eligible, valid):
@@ -73,7 +168,7 @@ class Learner:
     """Offline TD3-style RLT heads; checkpoints include targets and optimizers."""
     def __init__(self, c, device="cpu"):
         self.c, self.options = c, c["learner"]
-        self.model = Heads(c).to(device)
+        self.model = make_heads(c).to(device)
         self.target = copy.deepcopy(self.model).requires_grad_(False)
         self.ao = torch.optim.Adam(self.model.actor.parameters(), lr=self.options["actor_lr"])
         self.qo = torch.optim.Adam(self.model.critics.parameters(), lr=self.options["critic_lr"])
@@ -85,13 +180,13 @@ class Learner:
         self.step += 1
         z, state, ref = b["token"], b["state"], b["reference"]
         with torch.no_grad():
-            nxt = self.target.act(b["next_token"], b["next_state"], b["next_reference"])
+            nxt = self.target.act(b["next_token"], b["next_state"], b["next_reference"], phase=b.get("next_phase"))
             noise = (torch.randn_like(nxt) * o["target_noise"]).clamp(-o["target_noise_clip"], o["target_noise_clip"])
-            nv = torch.ones_like(b["valid"]) & self.model.active
-            smoothed = torch.where(self.model.active, (nxt + noise).clamp(-2.2, 2.2), nxt)
-            nq = self.target.q(b["next_token"], b["next_state"], b["next_reference"], smoothed, nv)
+            nv = torch.ones_like(b["valid"]) & self.model.active_for(b.get("next_phase"))
+            smoothed = self.target.smooth_action(nxt, b["next_reference"], noise, phase=b.get("next_phase"))
+            nq = self.target.q(b["next_token"], b["next_state"], b["next_reference"], smoothed, nv, b.get("next_scheduler_context"), phase=b.get("next_phase"))
             target = b["reward"] + b["discount"] * nq.min(-1).values
-        q = self.model.q(z, state, ref, b["action"], b["valid"])
+        q = self.model.q(z, state, ref, b["action"], b["valid"], b.get("scheduler_context"), phase=b.get("phase"))
         td = b.get("td_eligible", torch.ones_like(b["reward"], dtype=torch.bool))
         errors = (q - target[:, None]).square()
         qloss = (errors * td[:, None]).sum() / (2 * td.sum()).clamp(min=1)
@@ -112,11 +207,11 @@ class Learner:
         if self.step % o["actor_update_interval"] == 0:
             self.model.critics.requires_grad_(False)
             try:
-                pred = self.model.act(z, state, ref, dropout=o["reference_dropout"])
+                pred = self.model.act(z, state, ref, dropout=o["reference_dropout"], phase=b.get("phase"))
                 human_loss, ref_loss, nh, nr = supervised_losses(
                     pred, b["action"], ref, b["human"], b["bc_eligible"], b["valid"])
                 bc = o["human_bc_weight"] * human_loss + o["reference_weight"] * ref_loss
-                qvalues = self.model.q(z, state, ref, pred, b["valid"])[:, 0]
+                qvalues = self.model.q(z, state, ref, pred, b["valid"], b.get("scheduler_context"), phase=b.get("phase"))[:, 0]
                 qpi = (qvalues * td).sum() / td.sum().clamp(min=1)
                 weight = o["q_weight"] if self.critic_updates > o["critic_warmup_steps"] else 0.0
                 loss = bc - weight * qpi
@@ -134,6 +229,14 @@ class Learner:
                     weighted_ref_loss=float(o["reference_weight"] * ref_loss.detach()),
                     weighted_rl_loss=float(-weight * qpi.detach()), q_pi=float(qpi.detach()),
                     q_weight=weight, human_bc_elements=int(nh), reference_elements=int(nr))
+                if is_editor(self.c):
+                    delta = (pred - ref[..., :self.model.d]).detach()[self.model.active_for(b.get("phase")).expand_as(pred)]
+                    human_mask = b["human"] & b["bc_eligible"] & b["valid"]
+                    outside = (b["action"] - ref[..., :self.model.d]).abs() > self.model.scale
+                    metrics.update(editor_delta_mean_abs=float(delta.abs().mean()),
+                                   editor_delta_max_abs=float(delta.abs().max()),
+                                   editor_saturation_fraction=float((delta.abs() >= .99*self.model.scale).float().mean()),
+                                   editor_human_outside_fraction=float((outside & human_mask).sum()/human_mask.sum().clamp(min=1)))
             finally:
                 self.model.critics.requires_grad_(True)
             with torch.no_grad():

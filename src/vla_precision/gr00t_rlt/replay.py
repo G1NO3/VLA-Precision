@@ -28,19 +28,28 @@ class Replay:
           CREATE TABLE IF NOT EXISTS transitions(episode TEXT, seq INTEGER, payload BLOB,
             PRIMARY KEY(episode,seq));
           CREATE TABLE IF NOT EXISTS events(created REAL, episode TEXT, kind TEXT, detail TEXT);
+          CREATE TABLE IF NOT EXISTS transition_summary(episode TEXT, seq INTEGER,
+            human INTEGER, td INTEGER, bc INTEGER, PRIMARY KEY(episode,seq));
+          CREATE TABLE IF NOT EXISTS phase_events(episode TEXT, phase TEXT,
+            reward REAL, stamp_ns INTEGER, PRIMARY KEY(episode,phase));
         """)
 
     def recover(self):
         with self.db:
             self.db.execute("UPDATE episodes SET outcome='aborted' WHERE outcome='running'")
 
-    def begin(self, metadata):
-        eid = uuid.uuid4().hex
+    def begin(self, metadata, *, eid=None):
+        eid = eid or uuid.uuid4().hex
         with self.db:
             self.db.execute("INSERT INTO episodes VALUES(?,?,?,?,?,'running',?,NULL)",
                 (eid, metadata["phase"], metadata["contract_sha256"], metadata["token_sha256"],
                  metadata["behavior_sha256"], time.time()))
         return eid
+
+    def event(self, eid, kind, detail):
+        with self.db:
+            self.db.execute("INSERT INTO events VALUES(?,?,?,?)",
+                            (time.time(), eid, kind, json.dumps(detail)))
 
     def append(self, eid, record):
         blob = io.BytesIO()
@@ -51,6 +60,10 @@ class Replay:
                 raise ValueError("Cannot append to a closed episode")
             seq = self.db.execute("SELECT COUNT(*) FROM transitions WHERE episode=?", (eid,)).fetchone()[0]
             self.db.execute("INSERT INTO transitions VALUES(?,?,?)", (eid, seq, blob.getvalue()))
+            self.db.execute("INSERT INTO transition_summary VALUES(?,?,?,?,?)",
+                (eid, seq, int(np.any(record.get("human", False))),
+                 int(np.any(record.get("td_eligible", False))),
+                 int(np.any(record.get("bc_eligible", False)))))
 
     def finish(self, eid, outcome, terminal_ns):
         if outcome not in ("success", "failure", "discarded", "aborted"):
@@ -58,6 +71,15 @@ class Replay:
         with self.db:
             self.db.execute("UPDATE episodes SET outcome=?,terminal_ns=? WHERE id=? AND outcome='running'",
                             (outcome, terminal_ns, eid))
+
+    def phase_success(self, eid, phase, stamp_ns):
+        """One credited milestone per phase/trajectory, retained after discard."""
+        if phase not in ("p1", "p2", "p3", "p4", "p5") or stamp_ns <= 0:
+            raise ValueError("Invalid phase milestone")
+        with self.db:
+            if self.db.execute("SELECT outcome FROM episodes WHERE id=?", (eid,)).fetchone() != ("running",):
+                raise ValueError("Phase success requires a running trajectory")
+            self.db.execute("INSERT INTO phase_events VALUES(?,?,?,?)", (eid, phase, 1.0, stamp_ns))
 
     def discard(self, eid):
         with self.db:
@@ -68,36 +90,95 @@ class Replay:
         return dict(self.db.execute("SELECT outcome,COUNT(*) FROM episodes GROUP BY outcome"))
 
     def export(self, c, token_sha256, dest):
-        from .core import validate_replay
+        from .core import validate_replay, is_async_editor, is_shared
+        if token_sha256.startswith("bootstrap:"):
+            raise ValueError("Bootstrap replay needs a trained token and encode-bootstrap before RL export")
         rows, ids = [], []
+        start_phases, fulltask_successes = {}, []
+        capture_checked = {}
         # One read transaction: a discard must not produce a half-episode snapshot.
         with self.db:
             self.db.execute("BEGIN")
-            episodes = self.db.execute("SELECT id,outcome,terminal_ns FROM episodes WHERE phase=? "
-                "AND contract=? AND token=? AND outcome IN ('success','failure') ORDER BY created",
-                (c["phase"], c["contract_sha256"], token_sha256)).fetchall()
-            for eid, outcome, stamp in episodes:
+            scope = "contract=?" if is_shared(c) else "phase=? AND contract=?"
+            args = [c["contract_sha256"], token_sha256] if is_shared(c) else [c["phase"], c["contract_sha256"], token_sha256]
+            episodes = self.db.execute("SELECT id,outcome,terminal_ns,phase FROM episodes WHERE " + scope +
+                " AND token=? AND outcome IN ('success','failure') ORDER BY created", args).fetchall()
+            for eid, outcome, stamp, start_phase in episodes:
                 payloads = self.db.execute("SELECT seq,payload FROM transitions WHERE episode=? ORDER BY seq", (eid,)).fetchall()
                 if not payloads or [p[0] for p in payloads] != list(range(len(payloads))):
                     continue
                 ids.append(eid)
+                episode_rows = []
                 for i, (_, blob) in enumerate(payloads):
                     with np.load(io.BytesIO(blob), allow_pickle=False) as f:
                         row = {k: f[k].copy() for k in f.files}
+                    # Async capture is not durable when the action is returned.
+                    # Refuse training until BOTH exact observations are committed
+                    # and hash-verified. Cache small alignment fields, not images.
+                    for prefix in ("", "next_"):
+                        if prefix + "observation_receipt" in row:
+                            from .bootstrap import load_observation
+                            rel = str(row[prefix + "observation_file"].item())
+                            receipt = str(row[prefix + "observation_receipt"].item())
+                            key = (rel, receipt)
+                            if key not in capture_checked:
+                                captured = load_observation(self.root, row, c, prefix)
+                                capture_checked[key] = (captured["state"], captured["reference"])
+                            for name, expected in zip(("state", "reference"), capture_checked[key]):
+                                if not np.array_equal(row[prefix + name], expected):
+                                    raise ValueError("Observation/replay alignment mismatch: " + prefix + name)
                     row.update(outcome=outcome if i == len(payloads)-1 else "continuing",
                                episode_outcome=outcome, terminal_ns=stamp if i == len(payloads)-1 else 0)
-                    rows.append(row)
+                    episode_rows.append(row)
+                if is_shared(c):
+                    # An episode may begin at any phase, but cannot splice
+                    # independently reset phases or earn skipped milestones.
+                    start = int(episode_rows[0]["phase"])
+                    if start_phase != f"p{start+1}" or not 0 <= start < 5:
+                        raise ValueError("Episode start phase disagrees with first transition")
+                    start_phases[eid] = start_phase
+                    milestones = []
+                    for i, row in enumerate(episode_rows):
+                        if i and int(episode_rows[i-1]["next_phase"]) != int(row["phase"]):
+                            raise ValueError("Disconnected phase transitions")
+                        if int(row["phase_reward_ns"]):
+                            milestones.append((f"p{int(row['phase'])+1}", int(row["phase_reward_ns"])))
+                    events = self.db.execute("SELECT phase,stamp_ns FROM phase_events WHERE episode=? AND phase!='p5' ORDER BY phase", (eid,)).fetchall()
+                    if milestones != events or len({p for p, _ in milestones}) != len(milestones):
+                        raise ValueError("Missing or duplicate phase reward evidence")
+                    if outcome == "success" and (
+                            [p for p, _ in milestones] != [f"p{i+1}" for i in range(start, 4)]
+                            or int(episode_rows[-1]["phase"]) != 4):
+                        raise ValueError("Success requires all phases from episode start through P5")
+                    final = self.db.execute("SELECT stamp_ns FROM phase_events WHERE episode=? AND phase='p5'", (eid,)).fetchone()
+                    if outcome == "success" and (not final or not int(episode_rows[-1]["start_ns"]) <= final[0] <= stamp):
+                        raise ValueError("Final success lacks operator P5 milestone evidence")
+                    if outcome == "failure" and final:
+                        raise ValueError("Failure episode cannot also have final success")
+                    if outcome == "success" and start == 0:
+                        fulltask_successes.append(eid)
+                rows.extend(episode_rows)
         if not rows:
             raise ValueError("No complete compatible episodes; collect and label first")
         # Audit arrays are stored in SQLite; training interchange uses only these fields.
         keys = ("token", "next_token", "state", "next_state", "reference", "next_reference",
                 "action", "valid", "human", "bc_eligible", "td_eligible", "start_ns", "end_ns",
                 "terminal_ns", "outcome", "episode_outcome")
+        if is_async_editor(c):
+            keys += ("scheduler_context", "next_scheduler_context", "proposal_accepted", "autonomy", "next_autonomy")
+        if is_shared(c):
+            keys += ("phase", "next_phase", "phase_reward_ns")
         data = {k: np.stack([r[k] for r in rows]) for k in keys}
-        meta = dict(schema="gr00t_rlt_replay.v1", phase=c["phase"], contract_sha256=c["contract_sha256"],
+        meta = dict(schema="gr00t_rlt_replay.v1", phase="fulltask" if is_shared(c) else c["phase"], contract_sha256=c["contract_sha256"],
                     token_sha256=token_sha256, execution_contract=c["execution_contract"],
                     completed_episodes_only=True, episodes=ids, collector="bridge_sequential_v1",
                     human_td="excluded_controller_mismatch", action_evidence="bridge_published_not_motor_ack")
+        if is_async_editor(c):
+            meta.update(collector="bridge_async_act_v1", action_evidence="requested_chunk_not_act_blend")
+        if is_shared(c):
+            meta.update(episode_start_phases=start_phases,
+                        fulltask_success_episodes=fulltask_successes,
+                        success_scope="ordered_start_phase_through_p5")
         validate_replay(data, meta, c, token_sha256=token_sha256)
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)

@@ -8,11 +8,12 @@ from vla_precision.gr00t_rlt.replay import Replay
 from vla_precision.gr00t_rlt.model import Learner
 
 
-def test_committed_registry_overlay_preserves_recipe_pin(monkeypatch):
+@pytest.mark.parametrize("revision_name", ["REGISTRY_COMMIT", "PI05_COMPAT_COMMIT"])
+def test_committed_registry_overlay_preserves_recipe_pin(monkeypatch, revision_name):
     from vla_precision.gr00t_rlt import core
     c=load_config()
     def revision(cmd, **kwargs):
-        return core.REGISTRY_COMMIT if cmd[2]==c['starvla_root'] else c['rlinf_commit']
+        return getattr(core, revision_name) if cmd[2]==c['starvla_root'] else c['rlinf_commit']
     monkeypatch.setattr(core.subprocess,'check_output',revision)
     core.check_code(c)
     monkeypatch.setattr(core.subprocess,'check_output',lambda *a,**kw:'unreviewed-revision')

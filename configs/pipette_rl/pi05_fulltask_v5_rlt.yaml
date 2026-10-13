@@ -1,0 +1,82 @@
+schema: pi05_fulltask_rlt.v1
+# One frozen five-task checkpoint; phase-specific heads/episodes for initial RL bring-up.
+# Paths resolve against the workspace containing VLA-Precision, not the shell cwd.
+models_root: models
+prepared_root: datasets/g1-pipette-fulltask-rlt-v2
+output_root: outputs/pi05-fulltask-v5-rlt
+starvla_root: starVLA
+rlinf_root: RLinf
+starvla_commit: 11ba155b90f4ffd7f29814b991bc4ad76838f3cd
+rlinf_commit: c9e80673265b88a3eaf97d8dd3726d081ad3a889
+seed: 42
+state_dim: 59
+model_action_dim: 32
+actor_action_dim: 18
+horizon: 30
+views: [rgb, wrist_left]
+image_source: raw_video
+unnorm_key: new_embodiment
+feature_layer: prefix_final
+reference_seed: 42
+# Stage 2 updates the small actor/critics, NOT PI05's PaliGemma/flow expert.
+# Frozen reference: no state (matches v5 BC). RL head: normalized physical state59.
+# Shared 0925 demos are for OFFLINE token/head initialization, not RL rehearsal.
+freeze_backbone: true
+freeze_token_during_rl: true
+joint_seed_policy: frozen_reference
+# Offline tooling never enables a robot. Explicit live service + Bridge lane
+# are separate; this flag is NOT a hardware acceptance / safety override.
+live_enabled: false
+execution_contract: sequential_chunk_no_ensemble_v1
+reward:
+  source: jm_pipette/runs/qwenoft_ac/config.json
+  source_bridge_commit: ac8e7cd9b8003d574d5ea95b675c5733719fb9d3
+  clock: monotonic_elapsed
+  rate_hz: 60
+  gamma: 0.999499874937461
+  step_penalty: -0.005
+  success_reward: 10.0
+  failure_reward: 0.0
+  terminal_replaces_last_tick: true
+  outcome_scope: phase_episode
+token:
+  input_dim: 2048
+  embed_dim: 256
+  prefix_seq_len: 1024
+  num_layers: 2
+  num_heads: 8
+  mlp_ratio: 4.0
+  lr: 0.0001
+  batch_size: 4
+  updates: 2000
+learner:
+  bc_updates: 2000
+  actor_lr: 0.0001
+  critic_lr: 0.0003
+  batch_size: 128
+  updates: 600
+  critic_warmup_steps: 20
+  actor_update_interval: 2
+  q_weight: 0.1
+  human_bc_weight: 1.0
+  reference_weight: 1.0
+  reference_dropout: 0.5
+  target_tau: 0.005
+  target_noise: 0.01
+  target_noise_clip: 0.03
+  max_grad_norm: 1.0
+baseline:
+  repo: jren313/starvla-pipette-5task-v5-pi05
+  revision: 62eb95da5d72073abc27b3cfddd56c87baf84437
+  step: 14400
+  state_input: false
+  left_thumb: chunk_relative
+  weights_sha256: a635b2753760c994ec183b86c02cd8c594cbf6993084fbac8ec41e51f9961a03
+# Indices in the 18-D action (not the six-channel hardware register array).
+# Match VLAPolicyBridge.phase_poses.gr00t_phase_hand_holds.
+phases:
+  p1: {held_action_indices: [12, 17]}
+  p2: {held_action_indices: [13, 14, 15, 16, 17]}
+  p3: {held_action_indices: [12, 13, 14, 15, 16, 17]}
+  p4: {held_action_indices: [13, 14, 15, 16, 17]}
+  p5: {held_action_indices: [12, 17]}

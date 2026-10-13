@@ -2,7 +2,7 @@
 """Offline GR00T RLT: pinned downloads, feature probe/cache, token and AC training.
 
 No command in this entrypoint connects to Redis, cameras, DDS or a robot.
-The separate gr00t_rlt_live.py entrypoint serves the sequential Bridge collector.
+The separate gr00t_rlt_live.py serves the contract-matched sequential RLT or async ACT Editor collector.
 """
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ import subprocess
 
 import numpy as np
 
-from vla_precision.gr00t_rlt.core import DEFAULT, check_code, digest, load_config, sha256, validate_assets, validate_replay
+from vla_precision.gr00t_rlt.core import DEFAULT, check_code, digest, is_pi05, is_focus, load_config, sha256, validate_assets, validate_replay
+from vla_precision.gr00t_rlt.core import is_editor, is_async_editor, representation_sha
 
 
 def write_json(path, value):
@@ -28,8 +29,9 @@ def write_json(path, value):
 def download(c):
     from huggingface_hub import HfApi, snapshot_download
     b = c["baseline"]
-    checkpoint = f"gr00t/checkpoints/steps_{b['step']}_pytorch_model.pt"
-    names = [checkpoint, "gr00t/config.yaml", "gr00t/dataset_statistics.json"]
+    subdir = "pi05" if is_pi05(c) else "gr00t"
+    checkpoint = f"{subdir}/checkpoints/steps_{b['step']}_pytorch_model.pt"
+    names = [checkpoint, f"{subdir}/config.yaml", f"{subdir}/dataset_statistics.json"]
     info = HfApi().model_info(b["repo"], revision=b["revision"], files_metadata=True)
     remote = {f.rfilename: f for f in info.siblings}
     root = Path(c["run_root"])
@@ -38,7 +40,7 @@ def download(c):
     if shutil.disk_usage(root.parent).free < missing + (20 << 30):
         raise OSError("Keep at least 20 GiB free; refuse download")
     snapshot_download(b["repo"], revision=b["revision"], local_dir=root.parent,
-                      allow_patterns=names + ["gr00t/*.yaml", "README.md"], max_workers=2)
+                      allow_patterns=names + [f"{subdir}/*.yaml", "README.md"], max_workers=2)
     receipt = {"repo": b["repo"], "revision": b["revision"], "files": {}}
     for name in names:
         path = root.parent / name
@@ -46,7 +48,7 @@ def download(c):
         expected = remote[name].lfs.sha256 if remote[name].lfs else None
         if path.stat().st_size != remote[name].size or (expected and actual != expected):
             raise ValueError(f"Download size/SHA mismatch: {name}")
-        receipt["files"][name.removeprefix("gr00t/")] = dict(bytes=path.stat().st_size, sha256=actual)
+        receipt["files"][name.removeprefix(subdir + "/")] = dict(bytes=path.stat().st_size, sha256=actual)
     write_json(root / "download_receipt.json", receipt)
     print(json.dumps(validate_assets(c)), flush=True)
 
@@ -61,6 +63,13 @@ def readiness(c):
         except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
             checks[key] = {"ready": False, "reason": str(exc)}
     root = Path(c["prepared_root"]) / c["phase"]
+    if is_editor(c):
+        latest = Path(c["output"]) / "learner/latest.json"
+        return dict(phase=c["phase"], checkpoint=c["checkpoint"], checks=checks,
+                    collection_mode="editor_rl" if latest.exists() else "editor_zero",
+                    token_pretraining_required=False, bc_pretraining_required=False,
+                    offline_assets_ready=all(v["ready"] for v in checks.values()), online_ready=False,
+                    artifact_note="Zero residual on first use; check-live validates published weights. Physical acceptance still required.")
     checks["prepared_data"] = {"ready": (root / "manifest.json").is_file(), "path": str(root)}
     for key, subpath in (("features", "features/manifest.json"), ("token", "token/best.pt"),
                          ("bc", "bc/best.pt"), ("learner", "learner/latest.json")):
@@ -73,29 +82,33 @@ def readiness(c):
                     "Sequential collector and outcome controls still need physical robot acceptance",
                     "Do not reuse IL async+ACT logs as sequential_chunk_no_ensemble_v1 replay",
                     "PICO hardware axes/tracking-loss and bimanual handback need operator validation",
-                    "Only P1 token/BC prepared; other phases require their own trained artifacts"],
+                    "Each backend/phase requires its own contract-matched token and BC head"],
                 artifact_note="Presence is not checkpoint provenance or physical safety validation")
 
 
 def cache_features(c, args):
+    if is_focus(c):
+        raise ValueError("FOCUS uses cache-bootstrap --run from real collection; do not randomly resample tracker frames")
     from vla_precision.data.pipette_fulltask import FullTaskDataset
-    from vla_precision.gr00t_rlt.features import FrozenGR00TFeatures
+    from vla_precision.gr00t_rlt.features import frozen_features
     assets = validate_assets(c)
     check_code(c)
     root = Path(c["prepared_root"]) / c["phase"]
     datasets = {s: FullTaskDataset(root, split=s,
-                 left_thumb_relative=c["baseline"]["left_thumb"] == "chunk_relative")
+                 left_thumb_relative=c["baseline"]["left_thumb"] == "chunk_relative", raw_images=is_pi05(c))
                 for s in ("train", "validation")}
     if any(ds.phase != int(c["phase"][1:]) for ds in datasets.values()):
         raise ValueError("Prepared dataset phase differs from GR00T checkpoint")
     if args.command == "probe":
-        extractor = FrozenGR00TFeatures(c, args.device)
+        extractor = frozen_features(c, args.device)
         data = extractor.extract(datasets["train"][0])
         print(json.dumps({k: list(v.shape) for k, v in data.items()}))
         if not all(np.isfinite(v).all() for v in data.values()):
             raise ValueError("Non-finite probe features")
         return
     if not getattr(args, "allow_video_decode", False):
+        if is_pi05(c):
+            raise ValueError("PI05 needs raw source video: pass --allow-video-decode; do not reuse resize270 image caches")
         for dataset in datasets.values():
             for ep in dataset.episodes:
                 for view in c["views"]:
@@ -105,13 +118,13 @@ def cache_features(c, args):
         for dataset in datasets.values():
             for ep in dataset.episodes:
                 for view in c["views"]:
-                    if not ((dataset.shared / f"episode_{ep:06d}" / f"{view}.npy").is_file()
+                    if not ((not is_pi05(c) and (dataset.shared / f"episode_{ep:06d}" / f"{view}.npy").is_file())
                             or (dataset.source / "videos/chunk-000" / f"observation.images.{view}"
                                 / f"episode_{ep:06d}.mp4").is_file()):
                         raise FileNotFoundError(f"Missing source video/cache: episode {ep}, view {view}")
     out = Path(c["output"]) / "features"
     out.mkdir(parents=True, exist_ok=False)
-    extractor = FrozenGR00TFeatures(c, args.device)
+    extractor = frozen_features(c, args.device)
     records = []
     rng = np.random.default_rng(c["seed"])
     for split, dataset in datasets.items():
@@ -134,6 +147,8 @@ def fit_token(c, args):
     assets = validate_assets(c)
     root = Path(c["output"]) / "features"
     manifest = json.loads((root / "manifest.json").read_text())
+    from vla_precision.gr00t_rlt.bootstrap import source_check
+    source_check(manifest)
     if manifest["contract_sha256"] != c["contract_sha256"] or manifest["assets"] != assets:
         raise ValueError("Feature cache belongs to another baseline/contract")
     for row in manifest["records"]:
@@ -174,6 +189,7 @@ def fit_token(c, args):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
         opt.step()
         if step % 100 == 0 or step == updates:
+            source_check(manifest)
             model.eval()
             with torch.inference_mode():
                 errors = [float(model.loss(*batch([row]))[0]) for row in val]
@@ -200,27 +216,29 @@ def fit_heads(c, args):
     check_code(c)
     validate_assets(c)
     token = Path(c["output"]) / "token/best.pt"
-    saved_token = torch.load(token, map_location="cpu", weights_only=True)
-    if saved_token["contract_sha256"] != c["contract_sha256"]:
-        raise ValueError("Token belongs to another phase/experiment")
+    if not is_editor(c):
+        saved_token = torch.load(token, map_location="cpu", weights_only=True)
+        if saved_token["contract_sha256"] != c["contract_sha256"]:
+            raise ValueError("Token belongs to another phase/experiment")
+    rep_sha = representation_sha(c)
     meta = json.loads(args.replay.with_suffix(".json").read_text())
     with np.load(args.replay, allow_pickle=False) as f:
         data = {k: f[k].copy() for k in f.files}
-    r, d = validate_replay(data, meta, c, token_sha256=sha256(token))
+    r, d = validate_replay(data, meta, c, token_sha256=rep_sha)
     data.update(reward=r, discount=d)
     torch.manual_seed(c["seed"])
     rng = np.random.default_rng(c["seed"])
     learner = Learner(c, args.device)
     if args.resume:
         previous = torch.load(args.resume, map_location=args.device, weights_only=True)
-        if previous["contract_sha256"] != c["contract_sha256"] or previous["token_sha256"] != sha256(token):
+        if previous["contract_sha256"] != c["contract_sha256"] or previous["token_sha256"] != rep_sha:
             raise ValueError("Resume contract/token mismatch")
         learner.load_state_dict(previous["learner"])
         torch.set_rng_state(previous["torch_rng"].cpu())
         if args.device.startswith("cuda"):
             torch.cuda.set_rng_state_all([s.cpu() for s in previous["cuda_rng"]])
         rng.bit_generator.state = previous["numpy_rng"]
-    else:
+    elif not is_editor(c):
         warm = torch.load(Path(c["output"]) / "bc/best.pt", map_location=args.device, weights_only=True)
         if warm["contract_sha256"] != c["contract_sha256"] or warm["token_sha256"] != sha256(token):
             raise ValueError("BC warm-start contract/token mismatch")
@@ -228,7 +246,7 @@ def fit_heads(c, args):
         learner.target.load_state_dict(learner.model.state_dict())
     out = Path(c["output"]) / "learner"
     out.mkdir(parents=True, exist_ok=True)
-    if (out / "latest.json").exists() and not args.resume:
+    if ((out / "latest.json").exists() or (is_editor(c) and list(out.glob("step-*.pt")))) and not args.resume:
         raise ValueError("An existing learner requires explicit --resume; use a new output for a new run")
     updates = args.updates or c["learner"]["updates"]
     dest = out / f"step-{learner.step + updates:08d}.pt"
@@ -238,13 +256,25 @@ def fit_heads(c, args):
             "action", "valid", "human", "bc_eligible", "reward", "discount")
     if "td_eligible" in data:
         keys += ("td_eligible",)
+    if is_async_editor(c):
+        keys += ("scheduler_context", "next_scheduler_context")
+    from vla_precision.gr00t_rlt.core import is_shared
+    if is_shared(c):
+        keys += ("phase", "next_phase")
+        phase_rows = [np.flatnonzero(data["phase"] == p) for p in np.unique(data["phase"])]
     for _ in range(updates):
         if getattr(args, "replay_check", None):
             args.replay_check()
         ids = rng.integers(len(r), size=c["learner"]["batch_size"])
+        if is_shared(c):
+            # Equal expected mass for each observed phase, not each video length.
+            choices = rng.integers(len(phase_rows), size=c["learner"]["batch_size"])
+            ids = np.asarray([rng.choice(phase_rows[i]) for i in choices])
         batch = {k: torch.as_tensor(data[k][ids], device=args.device,
                                    dtype=torch.bool if data[k].dtype == np.bool_ else torch.float32) for k in keys}
         metrics = learner.update(batch)
+        if is_shared(c):
+            metrics["phase_samples"] = {f"p{i+1}": int((data["phase"][ids] == i).sum()) for i in range(5)}
         with (out / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(metrics, allow_nan=False) + "\n")
         if learner.step % 10 == 0:
@@ -252,7 +282,7 @@ def fit_heads(c, args):
     if getattr(args, "replay_check", None):
         args.replay_check()
     tmp = dest.with_suffix(".tmp")
-    torch.save(dict(learner=learner.state_dict(), contract_sha256=c["contract_sha256"], token_sha256=sha256(token),
+    torch.save(dict(learner=learner.state_dict(), contract_sha256=c["contract_sha256"], token_sha256=rep_sha,
                     replay_sha256=sha256(args.replay), replay_metadata_sha256=sha256(args.replay.with_suffix(".json")),
                     numpy_rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(),
                     cuda_rng=torch.cuda.get_rng_state_all() if args.device.startswith("cuda") else [],
@@ -274,6 +304,8 @@ def fit_bc(c, args):
     if saved["contract_sha256"] != c["contract_sha256"] or saved["feature_manifest_sha256"] != sha256(manifest_path):
         raise ValueError("Token/data contract mismatch")
     manifest = json.loads(manifest_path.read_text())
+    from vla_precision.gr00t_rlt.bootstrap import source_check
+    source_check(manifest)
     torch.manual_seed(c["seed"])
     rng = np.random.default_rng(c["seed"])
     token = token_model(c).to(args.device).eval().requires_grad_(False)
@@ -287,7 +319,10 @@ def fit_bc(c, args):
             with np.load(path, allow_pickle=False) as f:
                 z = token.encode_flat(torch.tensor(f["prefix"], device=args.device).float()[None],
                                       torch.tensor(f["mask"], device=args.device)[None])[0].cpu().numpy()
-                examples[row["split"]].append((z, f["state"].copy(), f["reference"].copy(), f["demo_action"][:, :18].copy()))
+                valid = f["demo_valid"].copy() if "demo_valid" in f else np.ones((30,18), bool)
+                if valid.shape != (30,18) or valid.dtype != np.bool_ or not valid.any():
+                    raise ValueError("Invalid BC publication mask")
+                examples[row["split"]].append((z, f["state"].copy(), f["reference"].copy(), f["demo_action"][:, :18].copy(), valid))
     del token
     model = Heads(c).to(args.device)
     opt = torch.optim.Adam(model.actor.parameters(), lr=c["learner"]["actor_lr"])
@@ -296,9 +331,10 @@ def fit_bc(c, args):
     def batch(rows):
         return [torch.tensor(np.stack(x), device=args.device, dtype=torch.float32) for x in zip(*rows)]
     def loss(rows):
-        z, s, ref, target = batch(rows)
+        z, s, ref, target, valid = batch(rows)
         error = (model.act(z, s, ref) - target).square()
-        return (error * model.active).sum() / (model.active.sum() * len(rows) * c["horizon"])
+        mask = valid * model.active
+        return (error * mask).sum() / mask.sum().clamp_min(1)
     best = float("inf")
     updates = args.updates or c["learner"]["bc_updates"]
     for step in range(1, updates + 1):
@@ -311,6 +347,7 @@ def fit_bc(c, args):
         torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 1.0, error_if_nonfinite=True)
         opt.step()
         if step % 100 == 0 or step == updates:
+            source_check(manifest)
             with torch.inference_mode():
                 scores = [float(loss([row])) for row in examples["validation"]]
             score = float(np.mean(scores))
@@ -324,11 +361,15 @@ def fit_bc(c, args):
                                 token_sha256=sha256(token_path), step=step, validation_mse=score,
                                 live_enabled=False), out / "best.tmp")
                 (out / "best.tmp").replace(out / "best.pt")
+    write_json(out / "metadata.json", dict(contract_sha256=c["contract_sha256"],
+               token_sha256=sha256(token_path), completed_updates=updates,
+               checkpoint_sha256=sha256(out / "best.pt"), best_validation=best))
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["download", "check", "status", "probe", "cache", "token", "bc", "train"])
+    p.add_argument("command", choices=["download", "check", "describe", "status", "probe", "cache", "token", "bc", "train", "cache-bootstrap", "encode-bootstrap"])
+    p.add_argument("--run", type=Path, help="FOCUS bootstrap replay root; pause actor first")
     p.add_argument("--config", type=Path, default=DEFAULT)
     p.add_argument("--phase", choices=["p1", "p2", "p3", "p4", "p5"], default="p1")
     p.add_argument("--device", default="cuda")
@@ -343,7 +384,21 @@ def main():
     if args.max_observations < 1 or (args.updates is not None and args.updates < 1):
         p.error("Counts must be positive")
     c = load_config(args.config, args.phase)
-    if args.command == "download":
+    if is_editor(c) and args.command in ("cache", "probe", "token", "bc", "cache-bootstrap", "encode-bootstrap"):
+        p.error("Direct editor needs no token/BC initialization; collect labelled episodes and train directly")
+    if args.command in ("cache-bootstrap", "encode-bootstrap"):
+        import fcntl
+        from vla_precision.gr00t_rlt.bootstrap import cache_bootstrap, encode_bootstrap
+        if args.run is None or not is_focus(c) or not (args.run / "replay.sqlite3").is_file():
+            p.error("FOCUS bootstrap requires --run pointing to a collected replay")
+        with (args.run / "training.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = (cache_bootstrap(c, args.run) if args.command == "cache-bootstrap"
+                      else encode_bootstrap(c, args.run, args.device))
+            print(json.dumps(result))
+    elif args.command == "describe":
+        print(json.dumps(c))  # GUI subprocess: no Torch dependency in web server
+    elif args.command == "download":
         download(c)
     elif args.command == "check":
         check_code(c)
