@@ -201,7 +201,7 @@ class FrozenFocusFeatures(FrozenPI05Features):
             available=timing is not None,
             target=record.get("target"), generation=record.get("generation"),
             locked=bool(record.get("locked")), using_prior=record.get("using_prior"),
-            record_age_ms=record.get("record_age_ms"))
+            record_age_ms=record.get("record_age_ms"), sam_cache=record.get("sam_cache"))
         self.last_timings = {**getattr(self, "last_timings", {}),
                              "focus_crop_ms": (cropped-started)*1000,
                              "focus_lock_wait_ms": (acquired-cropped)*1000}

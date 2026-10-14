@@ -10,9 +10,12 @@ MODES = ("normal", "await_neutral", "correcting", "resume_hold", "resume_ramp", 
 TAIL_DIM = 1 + 29 + 12 + len(MODES) + 2  # catchup, commands, mode, boundary wait, publication age
 CONTEXT_DIM = MAX_CHUNKS * ROW_DIM + TAIL_DIM
 CONTRACT = "async_act_proposal_v1"
+#: publish/playback rates of the 60 Hz-trained chunk; a recipe pins one
+SUPPORTED_ACTION_HZ = (30, 60)
 
 
-def pack_context(chunks, now, *, command_q, hands, catchup, mode="normal", boundary=None, published_at=None):
+def pack_context(chunks, now, *, command_q, hands, catchup, mode="normal", boundary=None, published_at=None,
+                 action_hz=60):
     """Snapshot the ACT queue at observation/request time, not response time.
 
     Effective age follows the production scheduler's latency-compensated clock.
@@ -25,8 +28,9 @@ def pack_context(chunks, now, *, command_q, hands, catchup, mode="normal", bound
         raise ValueError("ACT critic context overflow")
     rows = np.zeros((MAX_CHUNKS, ROW_DIM), np.float32)
     for i, chunk in enumerate(live):
-        if chunk.horizon != HORIZON or not np.isclose(chunk.step_dt, 1/60):
-            raise ValueError("ACT context requires 30 rows at 60 Hz")
+        if (action_hz not in SUPPORTED_ACTION_HZ or chunk.horizon != HORIZON
+                or not np.isclose(chunk.step_dt, 1/action_hz)):
+            raise ValueError(f"ACT context requires 30 rows at the recipe's {action_hz} Hz")
         values = []
         for key, size in GROUPS:
             arr = np.asarray(chunk.arrays[key], np.float32)

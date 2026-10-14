@@ -194,3 +194,22 @@ def test_replay_requires_all_phase_events_and_new_contract(tmp_path):
     with pytest.raises(ValueError,match="No complete"):
         db.export(old,representation_sha(old),tmp_path/"old-contract.npz")
     db.close()
+
+
+def test_half_speed_recipe_is_its_own_contract(tmp_path):
+    half = Path(str(CONTINUOUS).replace("continuous.yaml", "continuous_30hz.yaml"))
+    c30, c60 = load_config(half, workspace=tmp_path), load_config(CONTINUOUS, workspace=tmp_path)
+    assert c30["scheduler"]["action_hz"] == 30 and c60["scheduler"]["action_hz"] == 60
+    assert c30["contract_sha256"] != c60["contract_sha256"]
+    assert c30["output"] != c60["output"]
+    assert c30["reward"] == c60["reward"]   # elapsed-time discount clock is rate-independent
+
+
+def test_unsupported_playback_rate_is_rejected(tmp_path):
+    import yaml
+    raw = yaml.safe_load(Path(CONTINUOUS).read_text())
+    raw["scheduler"]["action_hz"] = 45
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="action_hz"):
+        load_config(path, workspace=tmp_path)

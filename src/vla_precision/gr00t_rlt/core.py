@@ -71,6 +71,10 @@ REGISTRY_COMMIT = "2c52f5f10fe232bd875bd0bdad8454775154bd58"
 # resize correction. The pinned GR00T v2 uses square views, so its input
 # geometry, model and action contract are unchanged. No descendant wildcard.
 PI05_COMPAT_COMMIT = "11ba155b90f4ffd7f29814b991bc4ad76838f3cd"
+# Reviewed FOCUS timing-only commit: no weights, crop geometry, action or replay
+# schema changes. Keep the recipe hash stable for already collected episodes.
+FOCUS_BASE_COMMIT = "de0a9a3bade4eb57d3ec53a82416aaa198dcb68b"
+FOCUS_TIMING_COMMIT = "0bc36a499a677ef2060a57c98c503120c8da5a1d"
 
 
 def check_code(c):
@@ -80,8 +84,12 @@ def check_code(c):
         accepted = {c[repo + "_commit"]}
         if repo == "starvla" and c["starvla_commit"] == REGISTRY_BASE:
             accepted.update((REGISTRY_COMMIT, PI05_COMPAT_COMMIT))
+        if repo == "starvla" and is_focus(c) and c["starvla_commit"] == FOCUS_BASE_COMMIT:
+            accepted.add(FOCUS_TIMING_COMMIT)
         if actual not in accepted:
-            raise ValueError(f"{repo} commit differs from validated recipe: {actual}")
+            raise ValueError(f"{repo} commit differs from validated recipe: {actual}; "
+                             f"accepted: {', '.join(sorted(accepted))}. "
+                             "Review code compatibility before updating the exact revision allowlist.")
 
 
 def sha256(path):
@@ -136,11 +144,17 @@ def load_config(path=DEFAULT, phase="p1", workspace=WORKSPACE):
         raise ValueError("PI05 v5 requires final prefix features and a no-state frozen reference")
     if is_pi05(c) and c.get("image_source") != "raw_video":
         raise ValueError("PI05 requires original pixels, not the GR00T resize270 image cache")
-    from .act_context import CONTRACT, CONTEXT_DIM
+    from .act_context import CONTRACT, CONTEXT_DIM, SUPPORTED_ACTION_HZ
     if is_async_editor(c):
+        # action_hz is the PLAYBACK rate of the 60 Hz-trained 30-row chunk
+        # (one row per publish tick): 30 = half-speed execution. It is part of
+        # the recipe, hence of the contract hash: never mix replay across it.
         if (c["execution_contract"] != CONTRACT or c.get("scheduler") != dict(
-                context_dim=CONTEXT_DIM, inference_hz=5, action_hz=60, mode="act", decay=0.01, handoff="latency")):
-            raise ValueError("Async editor requires pinned ACT scheduler/context contract")
+                context_dim=CONTEXT_DIM, inference_hz=5, action_hz=c.get("scheduler", {}).get("action_hz"),
+                mode="act", decay=0.01, handoff="latency")
+                or c["scheduler"]["action_hz"] not in SUPPORTED_ACTION_HZ):
+            raise ValueError("Async editor requires pinned ACT scheduler/context contract "
+                             f"(action_hz one of {SUPPORTED_ACTION_HZ})")
     elif c["execution_contract"] != "sequential_chunk_no_ensemble_v1":
         raise ValueError("Asynchronous/ensembled replay requires its own scheduler-aware adapter")
     if is_editor(c):

@@ -33,6 +33,23 @@ def record(c):
     return r
 
 
+def test_focus_timing_revision_is_exact_and_preserves_contract(monkeypatch):
+    from pathlib import Path
+    from vla_precision.gr00t_rlt import core
+    path = Path(__file__).resolve().parents[1] / "configs/pipette_rl/pi05_fulltask_v6_focus_continuous.yaml"
+    c = load_config(path)
+    original = c['contract_sha256']
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda *a, **kw: core.FOCUS_TIMING_COMMIT)
+    core.check_code(c)
+    assert c['starvla_commit'] == core.FOCUS_BASE_COMMIT
+    assert c['contract_sha256'] == original == 'c93f185f216b705eaeb74933f915ca04b8a6b95ed7f90ad4ea4a4e68795e8a9b'
+    with pytest.raises(ValueError, match='commit differs'):
+        core.check_code(load_config())  # not an exception for unrelated checkpoints
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda *a, **kw: 'unreviewed-descendant')
+    with pytest.raises(ValueError, match='accepted:'):
+        core.check_code(c)
+
+
 def test_replay_finish_discard_reopen_crash(tmp_path):
     c=load_config()
     db=Replay(tmp_path)
