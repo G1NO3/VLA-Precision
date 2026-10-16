@@ -1,5 +1,6 @@
 """Single-owner RLToken inference service. No robot or collection I/O."""
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -22,7 +23,7 @@ def check_live_weights(config):
         check_bootstrap(config)
         policy = LivePolicy.__new__(LivePolicy)
         policy.c, policy.device, policy.token_sha = config, "cpu", representation_sha(config)
-        policy._load_actor()
+        policy._select_actor()   # a check, not serving: no log line, no live-actor.json
         return dict(assets=assets, actor=policy.actor_path, actor_kind=policy.actor_kind,
                     token_sha256=policy.token_sha, behavior_sha256=policy.behavior,
                     weights_ready=True, hardware_validated=False)
@@ -41,16 +42,21 @@ def check_live_weights(config):
     policy = LivePolicy.__new__(LivePolicy)
     policy.c, policy.device, policy.token_sha = config, "cpu", token_sha
     policy.heads = Heads(config)
-    policy._load_actor()
+    policy._select_actor()
     return dict(assets=assets, actor=policy.actor_path, actor_kind=policy.actor_kind,
                 token_sha256=token_sha, behavior_sha256=policy.behavior,
                 weights_ready=True, hardware_validated=False)
+
+
+#: the served actor, for the console (VLAPolicyBridge gui/rlt_panel.py reads it)
+ACTOR_FILE = "live-actor.json"
 
 
 class LivePolicy:
     def __init__(self, config, device="cuda", *, bootstrap=False, run=None):
         self.c, self.device = config, device
         self.bootstrap = bootstrap
+        self.run = Path(run).resolve() if run is not None else None
         if bootstrap and (not is_focus(config) or is_editor(config)):
             raise ValueError("Reference-only bootstrap is explicit and FOCUS-v6 only")
         self.capture_root = Path(run).resolve() if run is not None and is_focus(config) else None
@@ -65,6 +71,7 @@ class LivePolicy:
             self.token_sha = bootstrap_token(config)
             self.behavior = config["baseline"]["weights_sha256"]
             self.actor_path, self.actor_kind = config["checkpoint"], "frozen_reference"
+            self._announce_actor(changed=True)
         elif is_editor(config):
             check_live_weights(config)
             self.token_sha = representation_sha(config)
@@ -90,7 +97,36 @@ class LivePolicy:
         self.stats = json.loads((Path(config["run_root"])/"dataset_statistics.json").read_text())[config["unnorm_key"]]["action"]
         sys.path.insert(0, str(Path(config["starvla_root"]).parent / "VLAPolicyBridge"))
 
-    def _load_actor(self):
+    def _load_actor(self, rollout=None):
+        """Serve the newest published actor (startup, and each NEW rollout)."""
+        before = getattr(self, "behavior", None)
+        self._select_actor()
+        self._announce_actor(changed=self.behavior != before, rollout=rollout)
+
+    def _announce_actor(self, changed, rollout=None):
+        """A log line whenever the served actor changes, and the served actor in
+        ``<run>/live-actor.json`` for the console. Advisory: a failed write
+        never stops serving."""
+        now = time.time()
+        if changed or not hasattr(self, "_actor_since"):
+            self._actor_since = now
+            name = (Path(self.actor_path).name if self.actor_kind in ("editor_rl", "rl", "bc")
+                    else self.actor_path)
+            print(f"[rlt actor] serving {self.actor_kind}: {name} (behavior {self.behavior[:16]}) "
+                  + ("at startup" if rollout is None else f"from rollout {rollout}"), flush=True)
+        run = getattr(self, "run", None)
+        if run is None:
+            return
+        record = dict(pid=os.getpid(), kind=self.actor_kind, checkpoint=str(self.actor_path),
+                      behavior=self.behavior, loaded=self._actor_since, checked=now, rollout=rollout)
+        tmp = run / f"{ACTOR_FILE}.{os.getpid()}.tmp"
+        try:
+            tmp.write_text(json.dumps(record))
+            os.replace(tmp, run / ACTOR_FILE)
+        except OSError:
+            pass
+
+    def _select_actor(self):
         root = Path(self.c["output"])
         latest = root / "learner/latest.json"
         if is_editor(self.c):
@@ -168,7 +204,7 @@ class LivePolicy:
             raise ValueError("Invalid full-task rollout identity")
         if rollout != self.episode:
             if not getattr(self, "bootstrap", False):
-                self._load_actor()
+                self._load_actor(rollout)
             if hasattr(self.features, "reset"):
                 self.features.reset()
             self.episode = rollout

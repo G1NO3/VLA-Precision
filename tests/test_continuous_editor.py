@@ -166,7 +166,7 @@ def test_serving_keeps_shared_weights_across_phase_and_pause(tmp_path, monkeypat
     reset, loaded = [], []
     p.features = SimpleNamespace(extract=lambda s:feature,reset=lambda:reset.append(1),
         physical_actions=lambda a,r:np.concatenate([a,r[:,18:]],axis=-1))
-    monkeypatch.setattr(p,"_load_actor",lambda:loaded.append(1))
+    monkeypatch.setattr(p,"_load_actor",lambda *rollout:loaded.append(1))
     obs = synthetic_observation()
     with pytest.raises(ValueError, match="rollout identity"):
         p.get_action(obs, {"episode":"missing-stable-trajectory-id"})

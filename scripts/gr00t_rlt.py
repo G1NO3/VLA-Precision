@@ -213,6 +213,9 @@ def fit_heads(c, args):
     from vla_precision.gr00t_rlt.model import Learner
     if args.replay is None:
         raise ValueError("--replay must be a validated bimanual sequential replay NPZ, not the old XYZ SQLite")
+    progress = getattr(args, "progress", None)  # gr00t_rlt.progress.Progress, optional
+    if progress:
+        progress.stage("load")
     check_code(c)
     validate_assets(c)
     token = Path(c["output"]) / "token/best.pt"
@@ -262,7 +265,13 @@ def fit_heads(c, args):
     if is_shared(c):
         keys += ("phase", "next_phase")
         phase_rows = [np.flatnonzero(data["phase"] == p) for p in np.unique(data["phase"])]
-    for _ in range(updates):
+    batch_size = c["learner"]["batch_size"]
+    if progress:
+        progress.stage("train", updates_done=0, updates_total=updates, batch_size=batch_size,
+                       dataset_transitions=len(r), samples_seen=0, start_step=learner.step,
+                       reference_weight=c["learner"]["reference_weight"],
+                       human_bc_weight=c["learner"]["human_bc_weight"])
+    for done in range(1, updates + 1):
         if getattr(args, "replay_check", None):
             args.replay_check()
         ids = rng.integers(len(r), size=c["learner"]["batch_size"])
@@ -279,16 +288,23 @@ def fit_heads(c, args):
             f.write(json.dumps(metrics, allow_nan=False) + "\n")
         if learner.step % 10 == 0:
             print(json.dumps(metrics), flush=True)
+        if progress:
+            progress.update(updates_done=done, samples_seen=done * batch_size, step=learner.step)
     if getattr(args, "replay_check", None):
         args.replay_check()
+    if progress:
+        progress.stage("save", updates_done=updates, samples_seen=updates * batch_size, step=learner.step)
     tmp = dest.with_suffix(".tmp")
     torch.save(dict(learner=learner.state_dict(), contract_sha256=c["contract_sha256"], token_sha256=rep_sha,
                     replay_sha256=sha256(args.replay), replay_metadata_sha256=sha256(args.replay.with_suffix(".json")),
                     numpy_rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(),
                     cuda_rng=torch.cuda.get_rng_state_all() if args.device.startswith("cuda") else [],
+                    learner_options=dict(c["learner"]),  # as trained (CLI overrides included)
                     live_enabled=False), tmp)
     tmp.replace(dest)
     write_json(out / "latest.json", dict(checkpoint=str(dest), sha256=sha256(dest), live_enabled=False))
+    if progress:
+        progress.update(force=True, checkpoint=str(dest))
 
 
 def fit_bc(c, args):

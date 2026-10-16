@@ -89,8 +89,11 @@ class Replay:
     def counts(self):
         return dict(self.db.execute("SELECT outcome,COUNT(*) FROM episodes GROUP BY outcome"))
 
-    def export(self, c, token_sha256, dest):
+    def export(self, c, token_sha256, dest, progress=None):
+        """``progress(**counts)``, optional: called per transition read (the
+        caller throttles) and once before the snapshot is written."""
         from .core import validate_replay, is_async_editor, is_shared
+        report = progress or (lambda **counts: None)
         if token_sha256.startswith("bootstrap:"):
             raise ValueError("Bootstrap replay needs a trained token and encode-bootstrap before RL export")
         rows, ids = [], []
@@ -103,7 +106,7 @@ class Replay:
             args = [c["contract_sha256"], token_sha256] if is_shared(c) else [c["phase"], c["contract_sha256"], token_sha256]
             episodes = self.db.execute("SELECT id,outcome,terminal_ns,phase FROM episodes WHERE " + scope +
                 " AND token=? AND outcome IN ('success','failure') ORDER BY created", args).fetchall()
-            for eid, outcome, stamp, start_phase in episodes:
+            for n, (eid, outcome, stamp, start_phase) in enumerate(episodes):
                 payloads = self.db.execute("SELECT seq,payload FROM transitions WHERE episode=? ORDER BY seq", (eid,)).fetchall()
                 if not payloads or [p[0] for p in payloads] != list(range(len(payloads))):
                     continue
@@ -130,6 +133,9 @@ class Replay:
                     row.update(outcome=outcome if i == len(payloads)-1 else "continuing",
                                episode_outcome=outcome, terminal_ns=stamp if i == len(payloads)-1 else 0)
                     episode_rows.append(row)
+                    report(step="read", episodes_done=n, episodes_total=len(episodes),
+                           transitions=len(rows)+len(episode_rows),
+                           observations_checked=len(capture_checked))
                 if is_shared(c):
                     # An episode may begin at any phase, but cannot splice
                     # independently reset phases or earn skipped milestones.
@@ -158,8 +164,12 @@ class Replay:
                     if outcome == "success" and start == 0:
                         fulltask_successes.append(eid)
                 rows.extend(episode_rows)
+                report(step="read", episodes_done=n+1, episodes_total=len(episodes),
+                       transitions=len(rows), observations_checked=len(capture_checked))
         if not rows:
             raise ValueError("No complete compatible episodes; collect and label first")
+        report(step="write", episodes_done=len(episodes), episodes_total=len(episodes),
+               transitions=len(rows), observations_checked=len(capture_checked))
         # Audit arrays are stored in SQLite; training interchange uses only these fields.
         keys = ("token", "next_token", "state", "next_state", "reference", "next_reference",
                 "action", "valid", "human", "bc_eligible", "td_eligible", "start_ns", "end_ns",
