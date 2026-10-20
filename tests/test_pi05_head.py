@@ -246,3 +246,53 @@ def test_micro_batched_actor_gradient_equals_the_full_batch_gradient(tmp_path):
     assert set(g1) == set(g2) and all(torch.allclose(g1[n], g2[n], atol=1e-6, rtol=1e-4) for n in g1)
     for k in ("human_bc_loss", "ref_loss", "hold_loss", "q_pi"):
         assert m1[k] == pytest.approx(m2[k], rel=1e-5, abs=1e-8)
+
+
+def test_installed_head_is_served_with_a_zero_editor_and_the_base_head_comes_back(tmp_path, monkeypatch):
+    import importlib.util, json
+    from vla_precision.gr00t_rlt import serving
+    from vla_precision.gr00t_rlt.core import sha256
+    c = load_config(CONTINUOUS, "p1", workspace=tmp_path)
+    (Path(c["output"]) / "learner").mkdir(parents=True)
+    trained = tiny_head()
+    torch.nn.init.constant_(trained.action_out_proj.bias, .5)
+    ckpt = tmp_path / "head-step-00000150.pt"
+    torch.save(dict(learner=dict(head={k: v for k, v in trained.state_dict().items() if "lm_head" not in k}, step=150),
+                    learner_options=dict(q_weight=0.0, batch_size=128), contract_sha256=c["contract_sha256"],
+                    base_checkpoint=c["checkpoint"], replay="snap.npz", episodes=["e1", "e2"]), ckpt)
+    spec = importlib.util.spec_from_file_location("pi05_head_rl", Path(__file__).resolve().parents[1] / "scripts/pi05_head_rl.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    cli.install(SimpleNamespace(head=ckpt, name="hgdagger-150", label=None), c)
+    installed = Path(c["output"]) / "learner/variant-head-hgdagger-150.pt"
+    meta = json.loads(installed.with_suffix(".json").read_text())
+    assert meta["kind"] == "pi05_head" and meta["sha256"] == sha256(installed) and "q_weight 0.0" in meta["label"]
+    with pytest.raises(FileExistsError):
+        cli.install(SimpleNamespace(head=ckpt, name="hgdagger-150", label=None), c)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    select = lambda record: (run / serving.SELECT_FILE).write_text(json.dumps(record))
+    select(dict(select="checkpoint", checkpoint=str(installed), sha256=sha256(installed)))
+    policy = serving.LivePolicy.__new__(serving.LivePolicy)
+    policy.c, policy.device, policy.run = c, "cpu", run
+    policy.token_sha = representation_sha(c)
+    served = tiny_head()
+    base_bias = served.action_out_proj.bias.clone()
+    policy.features = SimpleNamespace(model=SimpleNamespace(action_head=served))
+    policy._select_actor()
+    assert policy.actor_kind == "pi05_head" and policy.behavior == sha256(installed)
+    assert torch.equal(served.action_out_proj.bias, torch.full_like(base_bias, .5))
+    z, s, ref = torch.zeros(1, c["token"]["embed_dim"]), torch.zeros(1, c["state_dim"]), torch.randn(1, 30, 32)
+    assert torch.equal(policy.heads.act(z, s, ref, phase=torch.tensor([2])), ref[..., :18])   # zero editor
+    monkeypatch.setattr(serving.torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("reloaded")))
+    policy._select_actor()                          # next rollout, same selection: no re-hash or reload
+    assert policy.actor_kind == "pi05_head"
+    monkeypatch.undo()
+    select(dict(select="base"))
+    policy._select_actor()
+    assert policy.actor_kind == "editor_zero" and torch.equal(served.action_out_proj.bias, base_bias)
+    policy.c = dict(c, contract_sha256="x" * 64)
+    select(dict(select="checkpoint", checkpoint=str(installed), sha256=sha256(installed)))
+    with pytest.raises(ValueError, match="another recipe"):
+        policy._select_actor()

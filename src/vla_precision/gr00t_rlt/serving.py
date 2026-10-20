@@ -57,6 +57,15 @@ ACTOR_FILE = "live-actor.json"
 #: Absent = follow learner/latest.json. Read wherever the publication is: at
 #: startup and at each NEW rollout. The learner still resumes from latest.json.
 SELECT_FILE = "actor-select.json"
+#: an installed full PI05 action head (scripts/pi05_head_rl.py, operator
+#: 2026-10-20): served by swapping the frozen policy's action head and editing
+#: nothing, so the recorded reference IS that head's chunk.
+HEAD_KIND = "pi05_action_head.v1"
+
+
+def _stat(path):
+    st = Path(path).stat()
+    return st.st_size, st.st_mtime_ns
 
 
 def selected_actor(run):
@@ -121,6 +130,7 @@ class LivePolicy:
         if self.capture_root is not None and is_editor(config):
             from .capture_writer import CaptureWriter
             self.capture_writer = CaptureWriter(self.capture_root)
+        self._apply_head()   # a selected full head waits for the VLM to exist
         self.stats = json.loads((Path(config["run_root"])/"dataset_statistics.json").read_text())[config["unnorm_key"]]["action"]
         sys.path.insert(0, str(Path(config["starvla_root"]).parent / "VLAPolicyBridge"))
 
@@ -137,7 +147,7 @@ class LivePolicy:
         now = time.time()
         if changed or not hasattr(self, "_actor_since"):
             self._actor_since = now
-            name = (Path(self.actor_path).name if self.actor_kind in ("editor_rl", "rl", "bc")
+            name = (Path(self.actor_path).name if self.actor_kind in ("editor_rl", "rl", "bc", "pi05_head")
                     else self.actor_path)
             print(f"[rlt actor] serving {self.actor_kind}: {name} (behavior {self.behavior[:16]}) "
                   + ("at startup" if rollout is None else f"from rollout {rollout}")
@@ -167,21 +177,29 @@ class LivePolicy:
                 if choice is None and (list((root / "learner").glob("step-*.pt"))
                                        or getattr(self, "actor_kind", None) == "editor_rl"):
                     raise ValueError("Editor learner publication missing; refuse zero-policy fallback")
-                if not hasattr(self, "heads") or getattr(self, "actor_kind", None) != "editor_zero":
-                    # Fresh zero residual (a selected base must not keep served RL weights).
-                    # Local seed scope: no effect on the frozen flow sampler RNG.
-                    with torch.random.fork_rng(devices=[]):
-                        torch.default_generator.manual_seed(self.c["seed"])
-                        self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
-                self.heads.activation = "tanh"
+                self._zero_editor()
+                self._head_choice = None
+                self._apply_head()
                 self.actor_path, self.actor_kind = "zero-initialized residual editor", "editor_zero"
                 self.behavior = "editor_zero:" + self.c["contract_sha256"]
                 return
             entry = choice or json.loads(latest.read_text())
             path = Path(entry["checkpoint"]).resolve()
-            if path.parent != (root / "learner").resolve() or sha256(path) != entry["sha256"]:
+            if path.parent != (root / "learner").resolve():
                 raise ValueError("Invalid " + ("selected" if choice else "published") + " editor checkpoint")
-            saved = torch.load(path, map_location=self.device, weights_only=True)
+            served = getattr(self, "_head_choice", None)
+            if served is not None and served["path"] == path and served["sha256"] == entry["sha256"] and served["stat"] == _stat(path):
+                # The same installed head as the last rollout: skip re-hashing/loading ~1 GB.
+                self._apply_head()
+                return
+            if sha256(path) != entry["sha256"]:
+                raise ValueError("Invalid " + ("selected" if choice else "published") + " editor checkpoint")
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            if saved.get("kind") == HEAD_KIND:
+                self._select_head(path, entry["sha256"], saved)
+                return
+            self._head_choice = None
+            self._apply_head()
             if saved["contract_sha256"] != self.c["contract_sha256"] or saved["token_sha256"] != self.token_sha:
                 raise ValueError("Editor actor/representation contract mismatch")
             if not hasattr(self, "heads"):
@@ -215,6 +233,52 @@ class LivePolicy:
             self.heads.actor.load_state_dict(saved["actor"])
         self.behavior = sha256(path)
         self.actor_path, self.actor_kind = str(path), kind
+
+    def _zero_editor(self):
+        if not hasattr(self, "heads") or getattr(self, "actor_kind", None) not in ("editor_zero", "pi05_head"):
+            # Fresh zero residual (a selected base must not keep served RL weights).
+            # Local seed scope: no effect on the frozen flow sampler RNG.
+            with torch.random.fork_rng(devices=[]):
+                torch.default_generator.manual_seed(self.c["seed"])
+                self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
+        self.heads.activation = "tanh"
+
+    def _select_head(self, path, digest, saved):
+        """A full action head: the frozen policy's head swapped, zero editor."""
+        if saved.get("contract_sha256") != self.c["contract_sha256"]:
+            raise ValueError(f"{path.name}: action head trained for another recipe")
+        if Path(saved.get("base_checkpoint", "")).resolve() != Path(self.c["checkpoint"]).resolve():
+            raise ValueError(f"{path.name}: action head finetuned from another PI05 checkpoint")
+        state = saved.get("action_head")
+        if not isinstance(state, dict) or not state or any(not torch.isfinite(v).all() for v in state.values()):
+            raise ValueError(f"{path.name}: missing or non-finite action-head weights")
+        self._zero_editor()
+        self._head_choice = dict(path=path, sha256=digest, stat=_stat(path), state=state)
+        self._apply_head()
+        self.behavior = digest
+        self.actor_path, self.actor_kind = str(path), "pi05_head"
+
+    def _apply_head(self):
+        """Make the VLM's action head match the selection: the installed head, or
+        the checkpoint's own (kept on CPU at the first swap). No-op before the
+        VLM exists (startup, CPU preflight); __init__ calls it again after."""
+        features = getattr(self, "features", None)
+        want = getattr(self, "_head_choice", None)
+        served = getattr(self, "_head_served", None)
+        if features is None or (want is None and served is None) or (want is not None and served == want["sha256"]):
+            return
+        head = features.model.action_head
+        if want is None:
+            head.load_state_dict(self._base_head, strict=False)
+            self._head_served = None
+            return
+        if not hasattr(self, "_base_head"):
+            self._base_head = {k: v.detach().cpu().clone() for k, v in head.state_dict().items()
+                               if not k.startswith("gemma_expert.lm_head")}
+        missing, unexpected = head.load_state_dict(want["state"], strict=False)
+        if unexpected or any(not k.startswith("gemma_expert.lm_head") for k in missing):
+            raise ValueError(f"Action head layout mismatch: missing={missing[:3]} unexpected={unexpected[:3]}")
+        self._head_served = want["sha256"]
 
     def reset(self, options=None):
         return {"status": "ok"}  # reloading requires an explicit NEW episode id

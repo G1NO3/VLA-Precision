@@ -8,9 +8,14 @@
           editor checkpoint), the action head as the actor; human BC +
           reference/hold + Q, backpropagated through every denoising step.
   eval    offline P1/P3 edit and human-agreement metrics of a trained head.
+  install put a trained head into the live learner directory as
+          variant-head-<name>.pt (+ .json label), selectable in the console's
+          Serve model like any variant; the server swaps PI05's action head
+          and serves it with a zero editor (serving.HEAD_KIND).
 
-See vla_precision/gr00t_rlt/pi05_head.py for the formulation. Writes only to
---cache and --output; never to the live learner directory or the replay.
+See vla_precision/gr00t_rlt/pi05_head.py for the formulation. encode/train/eval
+write only to --cache and --output; only install writes to the learner
+directory (two new files, never an existing one), never to the replay.
 
   PYTHONPATH=src python scripts/pi05_head_rl.py encode --replay SNAPSHOT.npz
   PYTHONPATH=src python scripts/pi05_head_rl.py train --replay SNAPSHOT.npz --output outputs/pi05-head-rl/run1 \\
@@ -335,6 +340,43 @@ def train(a, c):
     print(json.dumps(dict(checkpoint=str(dest), serve=str(serve), sha256=sha256(dest))), flush=True)
 
 
+# --- install ----------------------------------------------------------------
+
+def install(a, c):
+    import re
+    import torch
+    from vla_precision.gr00t_rlt.serving import HEAD_KIND
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", a.name or ""):
+        raise ValueError("--name: lowercase letters, digits and dashes (it becomes variant-head-<name>.pt)")
+    learner = Path(c["output"]) / "learner"
+    dest = learner / f"variant-head-{a.name}.pt"
+    if dest.exists() or dest.with_suffix(".json").exists():
+        raise FileExistsError(f"{dest.name} exists; pick another --name (installed heads are never overwritten)")
+    saved = torch.load(a.head, map_location="cpu", weights_only=True)
+    if saved.get("contract_sha256") != c["contract_sha256"]:
+        raise ValueError("Head checkpoint belongs to another recipe")
+    if Path(saved["base_checkpoint"]).resolve() != Path(c["checkpoint"]).resolve():
+        raise ValueError("Head was finetuned from another PI05 checkpoint than this recipe serves")
+    state = saved["learner"]["head"]      # fp32 master weights; the server casts to its own dtypes
+    options = saved["learner_options"]
+    tmp = dest.with_suffix(".tmp")
+    torch.save(dict(kind=HEAD_KIND, action_head=state, contract_sha256=c["contract_sha256"],
+                    base_checkpoint=saved["base_checkpoint"], step=saved["learner"]["step"],
+                    learner_options=options, source=str(Path(a.head).resolve()),
+                    source_sha256=sha256(a.head), replay=saved.get("replay"), live_enabled=False), tmp)
+    tmp.replace(dest)
+    digest = sha256(dest)
+    label = a.label or (f"FULL HEAD, q_weight {options.get('q_weight')}, batch {options.get('batch_size')}, "
+                        f"{saved['learner']['step']} updates, {len(saved.get('episodes') or [])} ep")
+    (dest.with_suffix(".json")).write_text(json.dumps(dict(
+        label=label, kind="pi05_head", step=saved["learner"]["step"], start_step=0, updates=saved["learner"]["step"],
+        episodes=len(saved.get("episodes") or []) or None, snapshot=saved.get("replay"), sha256=digest,
+        source=str(Path(a.head).resolve()), created=time.time(),
+        note="Serves this action head in place of PI05's with a zero editor; the recorded reference is this head's chunk."),
+        indent=2))
+    print(json.dumps(dict(installed=str(dest), sha256=digest, label=label)), flush=True)
+
+
 # --- eval -------------------------------------------------------------------
 
 def evaluate(a, c):
@@ -399,10 +441,10 @@ def evaluate(a, c):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("command", choices=("encode", "train", "eval"))
+    p.add_argument("command", choices=("encode", "train", "eval", "install"))
     p.add_argument("--config", type=Path, default=CONFIG)
     p.add_argument("--run", type=Path, default=RUN)
-    p.add_argument("--replay", type=Path, required=True, help="replay snapshot .npz (with observation_file)")
+    p.add_argument("--replay", type=Path, help="encode/train/eval: replay snapshot .npz (with observation_file)")
     p.add_argument("--cache", type=Path, help="prefix K/V cache (default outputs/pi05-head-prefix-cache/<recipe>)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--limit", type=int, help="encode: at most this many new observations")
@@ -428,9 +470,13 @@ def main():
                    help="train: backpropagate every denoising step into the weights, but keep the state Jacobian "
                         "dx_{k+1}/dx_k only for the last K steps (identity before). Default: exact BPTT")
     p.add_argument("--term-stats-every", type=int, default=20, help="train: per-term gradient norms every N actor updates (3x backward); 0 = never")
-    p.add_argument("--head", type=Path, help="eval: head-step-*.pt (default: the base head)")
+    p.add_argument("--head", type=Path, help="eval: head-step-*.pt (default: the base head); install: the head to install")
     p.add_argument("--windows", type=int, default=400, help="eval: windows per set")
+    p.add_argument("--name", help="install: variant-head-<name>.pt")
+    p.add_argument("--label", help="install: the label shown in the console's Serve model (default: from the run's options)")
     a = p.parse_args()
+    if a.command != "install" and a.replay is None:
+        p.error(f"{a.command} needs --replay")
     if a.command == "train" and a.output is None:
         p.error("train needs --output")
     if not 0 <= a.human_batch_fraction < 1:
@@ -438,7 +484,9 @@ def main():
     if a.jacobian_steps is not None and a.jacobian_steps < 1:
         p.error("--jacobian-steps must be positive")
     c = load_config(a.config, "p1")
-    dict(encode=encode, train=train, eval=evaluate)[a.command](a, c)
+    if a.command == "install" and (a.head is None or a.name is None):
+        p.error("install needs --head head-step-*.pt and --name")
+    dict(encode=encode, train=train, eval=evaluate, install=install)[a.command](a, c)
 
 
 if __name__ == "__main__":
