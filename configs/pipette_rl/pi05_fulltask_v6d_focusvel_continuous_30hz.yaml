@@ -1,0 +1,94 @@
+# v6d: frozen reference sees velocity6; actor/critic and replay see normalized state65.
+# Independent from v6 replay and learner weights.
+# 30 Hz playback: the 60 Hz-trained 30-row chunk runs at half speed (1.0 s per
+# chunk), closer to teleoperation pace. reward.rate_hz stays 60: it is the
+# elapsed-time discount clock, so per-second discounting is unchanged.
+# New contract, replay and learner output; never mix with the 60 Hz recipe
+# pi05_fulltask_v6_focus_continuous.yaml.
+# Shared phase-conditioned actor/twin critic; one episode spans P1 -> P5.
+# Deliberately incompatible with the previous phase-terminal editor replay.
+schema: pi05_fulltask_editor.v3
+models_root: models
+prepared_root: datasets/g1-pipette-fulltask-focus-bootstrap
+output_root: outputs/pi05-fulltask-v6d-focusvel-editor-continuous-30hz
+starvla_root: starVLA
+rlinf_root: RLinf
+starvla_commit: de0a9a3bade4eb57d3ec53a82416aaa198dcb68b
+rlinf_commit: c9e80673265b88a3eaf97d8dd3726d081ad3a889
+seed: 42
+state_dim: 65
+model_action_dim: 32
+actor_action_dim: 18
+horizon: 30
+views: [rgb, focus]
+image_source: raw_video
+unnorm_key: new_embodiment
+feature_layer: prefix_final
+reference_seed: 42
+focus:
+  enabled: true
+  sam: small
+  mode: causal_background_stream
+  rate_hz: 10.0
+freeze_backbone: true
+freeze_token_during_rl: true
+joint_seed_policy: frozen_reference
+live_enabled: false
+execution_contract: async_act_proposal_v1
+scheduler:
+  context_dim: 14002
+  inference_hz: 5
+  action_hz: 30
+  mode: act
+  decay: 0.01
+  handoff: latency
+reward:
+  clock: monotonic_elapsed
+  rate_hz: 60
+  gamma: 0.999499874937461
+  # Old per-phase -0.3/s could outweigh all 15 milestone points in 50s.
+  # Start with sparse positive rewards; keep elapsed-time discounting.
+  step_penalty: 0.0
+  phase_reward: 1.0
+  success_reward: 11.0
+  failure_reward: 0.0
+  terminal_replaces_last_tick: true
+  outcome_scope: full_task_episode
+editor:
+  features: pi05_two_view_spatial_2x2_v1
+  residual_scale: 0.2
+token:
+  input_dim: 2048
+  embed_dim: 16384
+  prefix_seq_len: 1024
+learner:
+  actor_lr: 0.0001
+  critic_lr: 0.0003
+  batch_size: 128
+  updates: 600
+  critic_warmup_steps: 20
+  actor_update_interval: 2
+  q_weight: 0.1
+  human_bc_weight: 1.0
+  reference_weight: 1.0
+  reference_dropout: 0.0
+  target_tau: 0.005
+  target_noise: 0.01
+  target_noise_clip: 0.03
+  max_grad_norm: 1.0
+baseline:
+  repo: jren313/starvla-pipette-5task-v6d-pi05-egofocusvel
+  revision: b0b5f369ad16b1335c19d5c44037c1bc422cfbe3
+  step: 17931
+  checkpoint_file: final_model/pytorch_model.pt
+  state_input: true
+  state_input_keys: [state.wrist_vel]
+  model_state_dim: 6
+  left_thumb: chunk_relative
+  weights_sha256: 453268d2c9ac5c6116e21f79d926f1dfbe576d9771621cfc5e744e12dfe577b8
+phases:
+  p1: {held_action_indices: [12, 17]}
+  p2: {held_action_indices: [13, 14, 15, 16, 17]}
+  p3: {held_action_indices: [12, 13, 14, 15, 16, 17]}
+  p4: {held_action_indices: [13, 14, 15, 16, 17]}
+  p5: {held_action_indices: [12, 17]}

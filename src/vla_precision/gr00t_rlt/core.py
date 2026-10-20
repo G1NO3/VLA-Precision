@@ -54,7 +54,13 @@ def is_pi05(c):
     return c["schema"] == "pi05_fulltask_rlt.v1" or is_editor(c)
 
 
+def is_wrist_velocity(c):
+    return c.get("baseline", {}).get("state_input_keys") == ["state.wrist_vel"]
+
+
 def bridge_profile(c):
+    if is_wrist_velocity(c):
+        return "starvla_pi05_pipette_5taskv6d_egofocusvel_native_inspire"
     if is_focus(c):
         return "starvla_pi05_pipette_5taskv6_egofocus_native_inspire"
     return "starvla_pi05_pipette_5taskv5_inspire" if is_pi05(c) else "gr00t_pipette_fulltask_v2"
@@ -75,6 +81,13 @@ PI05_COMPAT_COMMIT = "11ba155b90f4ffd7f29814b991bc4ad76838f3cd"
 # schema changes. Keep the recipe hash stable for already collected episodes.
 FOCUS_BASE_COMMIT = "de0a9a3bade4eb57d3ec53a82416aaa198dcb68b"
 FOCUS_TIMING_COMMIT = "0bc36a499a677ef2060a57c98c503120c8da5a1d"
+# Reviewed FOCUS SAM2 history bound (forward streaming only): prunes frames and
+# outputs SAM2 memory attention never reads; same weights, crop and contract.
+FOCUS_HISTORY_COMMIT = "a7c0ddd772ccf012df119833c5e197476e96fc7f"
+# Reviewed v6d serving commit: registers the egofocusvel data config and sends
+# only the checkpoint's state_input_keys. Run A (no model state) is unchanged;
+# v6d needs it, so a wrist-velocity recipe accepts only this revision.
+FOCUS_VELOCITY_COMMIT = "32aae819cae2cea066f6a19fcfd308d5c818c248"
 
 
 def check_code(c):
@@ -85,7 +98,8 @@ def check_code(c):
         if repo == "starvla" and c["starvla_commit"] == REGISTRY_BASE:
             accepted.update((REGISTRY_COMMIT, PI05_COMPAT_COMMIT))
         if repo == "starvla" and is_focus(c) and c["starvla_commit"] == FOCUS_BASE_COMMIT:
-            accepted.add(FOCUS_TIMING_COMMIT)
+            accepted = ({FOCUS_VELOCITY_COMMIT} if is_wrist_velocity(c) else
+                        {c["starvla_commit"], FOCUS_TIMING_COMMIT, FOCUS_HISTORY_COMMIT, FOCUS_VELOCITY_COMMIT})
         if actual not in accepted:
             raise ValueError(f"{repo} commit differs from validated recipe: {actual}; "
                              f"accepted: {', '.join(sorted(accepted))}. "
@@ -129,8 +143,8 @@ def load_config(path=DEFAULT, phase="p1", workspace=WORKSPACE):
             raise ValueError("Invalid held action indices")
         if c["held_action_indices"] != V2_PHASE_HELD[phase]:
             raise ValueError("v2 phase hand mask differs from the deployed bridge contract")
-    if (c["state_dim"], c["model_action_dim"], c["actor_action_dim"], c["horizon"]) != (59, 32, 18, 30):
-        raise ValueError("Expected state59, full32, actor18, horizon30")
+    if (c["state_dim"], c["model_action_dim"], c["actor_action_dim"], c["horizon"]) != (65 if is_wrist_velocity(c) else 59, 32, 18, 30):
+        raise ValueError("Expected state59 (v6d state65), full32, actor18, horizon30")
     expected_views = ["rgb", "focus"] if is_focus(c) else ["rgb", "wrist_left"]
     if c["views"] != expected_views or c["joint_seed_policy"] != "frozen_reference":
         raise ValueError("Unexpected camera/joint-seed contract")
@@ -140,8 +154,12 @@ def load_config(path=DEFAULT, phase="p1", workspace=WORKSPACE):
     frozen = c.get("freeze_backbone") if is_pi05(c) else c.get("freeze_gr00t")
     if c["live_enabled"] or not frozen or not c["freeze_token_during_rl"]:
         raise ValueError("Require frozen backbone/token and live_enabled=false; live collection uses an explicit separate entrypoint")
-    if is_pi05(c) and (c["feature_layer"] != "prefix_final" or c["baseline"].get("state_input") is not False):
-        raise ValueError("PI05 v5 requires final prefix features and a no-state frozen reference")
+    if is_wrist_velocity(c) and (not is_editor(c) or not is_focus(c)
+            or c["baseline"].get("model_state_dim") != 6):
+        raise ValueError("Wrist velocity requires a FOCUS editor with six model state dims")
+    if is_pi05(c) and (c["feature_layer"] != "prefix_final"
+            or c["baseline"].get("state_input") is not is_wrist_velocity(c)):
+        raise ValueError("PI05 requires final prefix features and matching frozen reference state input")
     if is_pi05(c) and c.get("image_source") != "raw_video":
         raise ValueError("PI05 requires original pixels, not the GR00T resize270 image cache")
     from .act_context import CONTRACT, CONTEXT_DIM, SUPPORTED_ACTION_HZ
@@ -175,7 +193,10 @@ def load_config(path=DEFAULT, phase="p1", workspace=WORKSPACE):
     for name in ("models_root", "prepared_root", "output_root", "starvla_root", "rlinf_root"):
         c[name] = str((Path(workspace) / c[name]).resolve())
     c["run_root"] = str(Path(c["models_root"]) / c["baseline"]["repo"].split("/")[-1] / ("pi05" if is_pi05(c) else "gr00t"))
-    c["checkpoint"] = str(Path(c["run_root"]) / "checkpoints" / f"steps_{c['baseline']['step']}_pytorch_model.pt")
+    checkpoint_file = Path(c["baseline"].get("checkpoint_file", f"checkpoints/steps_{c['baseline']['step']}_pytorch_model.pt"))
+    if checkpoint_file.is_absolute() or ".." in checkpoint_file.parts:
+        raise ValueError("Checkpoint file must stay within its model directory")
+    c["checkpoint"] = str(Path(c["run_root"]) / checkpoint_file)
     c["output"] = str(Path(c["output_root"]) / ("shared" if is_shared(c) else phase))
     stats_path = Path(c["run_root"]) / "dataset_statistics.json"
     if stats_path.is_file():
@@ -184,6 +205,8 @@ def load_config(path=DEFAULT, phase="p1", workspace=WORKSPACE):
         if not is_shared(c):
             active[c["held_action_indices"]] = False
         c["action_active"] = active.tolist()
+        c["action_half_range"] = ((np.asarray(action["q99"])[:18] - np.asarray(action["q01"])[:18]) / 2).tolist()
+        c["action_q01"], c["action_q99"] = list(action["q01"][:18]), list(action["q99"][:18])
         if len(c["action_active"]) != 18 or not any(c["action_active"]):
             raise ValueError("Expected nonempty 18-channel physical control mask")
     return c
@@ -229,11 +252,11 @@ def validate_assets(c, *, verify_weights=False):
     stats = json.loads((root / "dataset_statistics.json").read_text())[c["unnorm_key"]]
     f = cfg["framework"]
     if is_pi05(c):
-        if (f["name"] != "PI05" or f["discrete_state_input"] is not False
+        if (f["name"] != "PI05" or f["discrete_state_input"] is not is_wrist_velocity(c)
                 or f["action_dim"] != 32 or f["action_horizon"] != 30
                 or f["paligemma_config"]["width"] != c["token"]["input_dim"]
                 or f["image_resolution"] != [224, 224] or f["num_inference_steps"] != 10):
-            raise ValueError("Wrong PI05 v5 no-state backbone/action/view layout")
+            raise ValueError("Wrong PI05 backbone/state/action/view layout")
         if is_editor(c) and f.get("image_keys", ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]) != ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
             raise ValueError("Editor requires pinned ego/focus/dummy image-token order")
     else:
@@ -242,12 +265,20 @@ def validate_assets(c, *, verify_weights=False):
         if any(f["action_model"][k] != v for k, v in
                (("state_dim", 59), ("action_dim", 32), ("action_horizon", 30))):
             raise ValueError("Wrong baseline state/action layout")
+    if is_wrist_velocity(c):
+        full = yaml.safe_load((root / "config.full.yaml").read_text())
+        vla = full["datasets"]["vla_data"]
+        if (f.get("max_state_dim") != 6 or vla.get("include_state") is not True
+                or vla.get("state_input_keys") != ["state.wrist_vel"]):
+            raise ValueError("v6d frozen reference must consume only six wrist velocity state values")
     relative = cfg["datasets"]["vla_data"]["action_mode_apply_keys"]
-    if is_focus(c) and cfg["datasets"]["vla_data"]["data_mix"] != "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix":
+    expected_mix = ("unitree_g1_pipette_egofocusvel_5task447v12_pi05sq224_train_mix" if is_wrist_velocity(c)
+                    else "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix")
+    if is_focus(c) and cfg["datasets"]["vla_data"]["data_mix"] != expected_mix:
         raise ValueError("FOCUS checkpoint must consume ego + focus, not wrist")
     if ("action.left_hand_rel" in relative) != (c["baseline"]["left_thumb"] == "chunk_relative"):
         raise ValueError("Baseline left-thumb action semantics differ from recipe")
-    for key, width in (("state", 59), ("action", 32)):
+    for key, width in (("state", c["state_dim"]), ("action", 32)):
         for quantile in ("q01", "q99"):
             values = np.asarray(stats[key][quantile])
             if values.shape != (width,) or not np.isfinite(values).all():
@@ -258,8 +289,10 @@ def validate_assets(c, *, verify_weights=False):
     receipt = json.loads((root / "download_receipt.json").read_text())
     if receipt["repo"] != c["baseline"]["repo"] or receipt["revision"] != c["baseline"]["revision"]:
         raise ValueError("Checkpoint revision mismatch")
-    weight_entry = f"checkpoints/{checkpoint.name}"
+    weight_entry = checkpoint.relative_to(root).as_posix()
     required = {"config.yaml", "dataset_statistics.json", weight_entry}
+    if is_wrist_velocity(c):
+        required.add("config.full.yaml")
     if not required <= set(receipt["files"]):
         raise ValueError("Download receipt is missing required artifacts")
     if (c["baseline"].get("weights_sha256")
@@ -269,10 +302,10 @@ def validate_assets(c, *, verify_weights=False):
         path = root / name
         if path.stat().st_size != expected["bytes"]:
             raise ValueError(f"Incomplete artifact: {name}")
-        if (verify_weights or name != f"checkpoints/{checkpoint.name}") and sha256(path) != expected["sha256"]:
+        if (verify_weights or name != weight_entry) and sha256(path) != expected["sha256"]:
             raise ValueError(f"Artifact hash mismatch: {name}")
     return {"phase": c["phase"], "checkpoint": str(checkpoint), "contract_sha256": c["contract_sha256"],
-            "weights_sha256": receipt["files"][f"checkpoints/{checkpoint.name}"]["sha256"],
+            "weights_sha256": receipt["files"][weight_entry]["sha256"],
             "statistics_sha256": sha256(root / "dataset_statistics.json"),
             "action_active": c["action_active"], "held_action_indices": c["held_action_indices"],
             "reward": c["reward"], "live_enabled": False}
@@ -294,7 +327,7 @@ def validate_replay(data, meta, c, *, token_sha256):
     n = len(data["state"])
     if not n:
         raise ValueError("Empty replay")
-    shapes = {"state": (n, 59), "next_state": (n, 59),
+    shapes = {"state": (n, c["state_dim"]), "next_state": (n, c["state_dim"]),
               "token": (n, c["token"]["embed_dim"]), "next_token": (n, c["token"]["embed_dim"]),
               "reference": (n, 30, 32), "next_reference": (n, 30, 32),
               "action": (n, 30, 18), "valid": (n, 30, 18),
@@ -363,3 +396,44 @@ def validate_replay(data, meta, c, *, token_sha256):
         rewards.append(r)
         discounts.append(d)
     return np.asarray(rewards, np.float32), np.asarray(discounts, np.float32)
+
+
+# Human BC keeps only rows where the operator's command moves (operator
+# 2026-10-19: "only movement is helpful"). A held takeover row labels "stay
+# here", which teaches the editor to cancel the reference. Labels are the
+# normalized chunk-relative wrist pose (bridge editor_bridge._human_labels),
+# so a row's speed is its change to a labelled neighbour row times the action
+# half-range, at the row rate. Train-time only: the replay is untouched.
+STATIC_HUMAN = dict(pos_mps=.002, rot_radps=.02, hand_per_s=30.)
+_HUMAN_GROUPS = ((slice(0, 3), slice(3, 6)), (slice(6, 9), slice(9, 12)))
+
+
+def drop_static_human(data, half_range, action_hz, pos_mps, rot_radps, hand_per_s):
+    """Clear ``human`` and ``bc_eligible`` (both, so a dropped row gets no
+    reference loss either) on human rows whose command is still. Per arm
+    (xyz + rotation together) and per hand channel; a labelled row with no
+    labelled neighbour has no measurable motion and is dropped. Returns
+    counts of human BC elements before/after."""
+    mask = data["human"] & data["bc_eligible"] & data["valid"]
+    before = int(mask.sum())
+    phys = data["action"] * np.asarray(half_range, np.float32)[:18] * action_hz   # per-row change -> per second
+    step = np.diff(phys, axis=1)                                                    # (n, 29, 18)
+    still = np.zeros_like(mask)
+
+    def speeds(norms, rows):
+        both = rows[:, 1:] & rows[:, :-1]
+        fwd = np.where(both, norms, -1.)
+        return np.maximum(np.pad(fwd, ((0, 0), (0, 1)), constant_values=-1.),
+                          np.pad(fwd, ((0, 0), (1, 0)), constant_values=-1.))
+    for pos, rot in _HUMAN_GROUPS:
+        rows = mask[:, :, pos].any(-1) | mask[:, :, rot].any(-1)
+        moving = ((speeds(np.linalg.norm(step[:, :, pos], axis=-1), rows) >= pos_mps)
+                  | (speeds(np.linalg.norm(step[:, :, rot], axis=-1), rows) >= rot_radps))
+        still[:, :, pos.start:rot.stop] = (rows & ~moving)[..., None]
+    for j in range(12, 18):
+        rows = mask[:, :, j]
+        still[:, :, j] = rows & ~(speeds(np.abs(step[:, :, j]), rows) >= hand_per_s)
+    drop = still & mask
+    data["human"] = data["human"] & ~drop
+    data["bc_eligible"] = data["bc_eligible"] & ~drop
+    return dict(human_bc_elements=before, kept=before - int(drop.sum()), dropped_static=int(drop.sum()))

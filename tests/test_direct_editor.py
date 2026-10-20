@@ -190,6 +190,72 @@ def test_replay_train_resume_publication_and_discard_without_token(tmp_path, mon
         bare_policy(c)._load_actor()
 
 
+def test_operator_selects_served_round_base_or_latest(tmp_path, monkeypatch):
+    """GUI 'Serve model': <run>/actor-select.json picks a published round or the
+    zero-residual base; absent/latest follows latest.json. The learner's
+    resume point (latest.json) is untouched by the choice."""
+    from vla_precision.gr00t_rlt.model import make_heads
+    from vla_precision.gr00t_rlt.serving import SELECT_FILE
+    torch.set_num_threads(1)
+    c = recipe(tmp_path)
+    cli_path = Path(__file__).resolve().parents[1] / 'scripts/gr00t_rlt.py'
+    spec = importlib.util.spec_from_file_location('editor_select_cli', cli_path)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    monkeypatch.setattr(cli, 'check_code', lambda c: None)
+    monkeypatch.setattr(cli, 'validate_assets', lambda c: None)
+    db = Replay(tmp_path/'replay')
+    eid = db.begin(dict(phase='p1', contract_sha256=c['contract_sha256'], token_sha256=representation_sha(c),
+                        behavior_sha256='editor_zero:'+c['contract_sha256']))
+    db.append(eid, editor_record(c))
+    db.finish(eid, 'success', 1_000_000_001)
+    snapshot = tmp_path/'snapshot.npz'
+    db.export(c, representation_sha(c), snapshot)
+    db.close()
+    learner = Path(c['output'])/'learner'
+    args = SimpleNamespace(device='cpu', replay=snapshot, resume=None, updates=2)
+    cli.fit_heads(c, args)                                   # round 1 -> step 2
+    args.resume = learner/'step-00000002.pt'
+    cli.fit_heads(c, args)                                   # round 2 -> step 4
+    round1 = json.loads((learner/'step-00000002.json').read_text())
+    assert (round1['step'], round1['start_step'], round1['updates']) == (2, 0, 2)
+    assert (round1['episodes'], round1['transitions']) == (1, 1)
+    assert round1['sha256'] == sha256(learner/'step-00000002.pt')
+    assert json.loads((learner/'step-00000004.json').read_text())['start_step'] == 2
+
+    run = tmp_path/'run'
+    run.mkdir()
+    policy = bare_policy(c)
+    policy.run = run
+    policy._load_actor()                                     # no choice file: newest round
+    assert (Path(policy.actor_path).name, policy.selection) == ('step-00000004.pt', 'latest')
+    (run/SELECT_FILE).write_text(json.dumps(dict(select='checkpoint', checkpoint=str(learner/'step-00000002.pt'),
+                                                 sha256=round1['sha256'])))
+    policy._load_actor('rollout-a')
+    assert (Path(policy.actor_path).name, policy.actor_kind, policy.selection) == ('step-00000002.pt', 'editor_rl', 'checkpoint')
+    assert policy.behavior == round1['sha256']
+    assert json.loads((run/'live-actor.json').read_text())['selection'] == 'checkpoint'
+    (run/SELECT_FILE).write_text(json.dumps(dict(select='base')))
+    policy._load_actor('rollout-b')
+    assert (policy.actor_kind, policy.behavior) == ('editor_zero', 'editor_zero:'+c['contract_sha256'])
+    with torch.random.fork_rng(devices=[]):
+        torch.default_generator.manual_seed(c['seed'])
+        fresh = make_heads(c).state_dict()
+    assert all(torch.equal(v, fresh[k]) for k, v in policy.heads.state_dict().items())   # RL weights dropped
+    (run/SELECT_FILE).write_text(json.dumps(dict(select='latest')))
+    policy._load_actor('rollout-c')
+    assert Path(policy.actor_path).name == 'step-00000004.pt'
+    assert Path(json.loads((learner/'latest.json').read_text())['checkpoint']).name == 'step-00000004.pt'
+    (run/SELECT_FILE).write_text(json.dumps(dict(select='checkpoint', checkpoint=str(learner/'step-00000002.pt'),
+                                                 sha256='wrong')))
+    with pytest.raises(ValueError, match='Invalid selected editor checkpoint'):
+        policy._load_actor('rollout-d')
+    for bad in ('{broken', json.dumps(dict(select='newest')), json.dumps(dict(select='checkpoint'))):
+        (run/SELECT_FILE).write_text(bad)
+        with pytest.raises(ValueError):
+            policy._load_actor('rollout-e')
+
+
 def test_corrupt_publication_never_silently_initializes_zero(tmp_path):
     c = recipe(tmp_path)
     root = Path(c['output'])/'learner'

@@ -8,13 +8,14 @@ import time
 import numpy as np
 import torch
 
-from .core import check_code, sha256, validate_assets, is_focus, is_editor, representation_sha, is_shared, phase_active
+from .core import check_code, sha256, validate_assets, is_focus, is_editor, representation_sha, is_shared, phase_active, is_wrist_velocity
 from .features import frozen_features
-from .model import Heads, token_model, make_heads, spatial_features
+from .model import EDITOR_ACTIVATIONS, Heads, token_model, make_heads, spatial_features
 
 
-def check_live_weights(config):
-    """CPU-only preflight. Never instantiate the VLM, bind a port or touch replay."""
+def check_live_weights(config, run=None):
+    """CPU-only preflight. Never instantiate the VLM, bind a port or touch replay.
+    With ``run``, it checks the actor the operator selected there (SELECT_FILE)."""
     check_code(config)
     assets = validate_assets(config)
     root = Path(config["output"])
@@ -23,6 +24,7 @@ def check_live_weights(config):
         check_bootstrap(config)
         policy = LivePolicy.__new__(LivePolicy)
         policy.c, policy.device, policy.token_sha = config, "cpu", representation_sha(config)
+        policy.run = Path(run).resolve() if run is not None else None
         policy._select_actor()   # a check, not serving: no log line, no live-actor.json
         return dict(assets=assets, actor=policy.actor_path, actor_kind=policy.actor_kind,
                     token_sha256=policy.token_sha, behavior_sha256=policy.behavior,
@@ -41,6 +43,7 @@ def check_live_weights(config):
     # Reuse the exact publication/hash and actor/token checks of the server.
     policy = LivePolicy.__new__(LivePolicy)
     policy.c, policy.device, policy.token_sha = config, "cpu", token_sha
+    policy.run = Path(run).resolve() if run is not None else None
     policy.heads = Heads(config)
     policy._select_actor()
     return dict(assets=assets, actor=policy.actor_path, actor_kind=policy.actor_kind,
@@ -50,6 +53,30 @@ def check_live_weights(config):
 
 #: the served actor, for the console (VLAPolicyBridge gui/rlt_panel.py reads it)
 ACTOR_FILE = "live-actor.json"
+#: the operator's served-actor choice, run root (gui/rlt_panel.py writes it).
+#: Absent = follow learner/latest.json. Read wherever the publication is: at
+#: startup and at each NEW rollout. The learner still resumes from latest.json.
+SELECT_FILE = "actor-select.json"
+
+
+def selected_actor(run):
+    """None = the newest publication; "base" = the pre-RL actor (zero-residual
+    editor / BC actor); else {checkpoint, sha256} of one published learner step.
+    An unreadable choice raises: never serve something the operator did not pick."""
+    if run is None:
+        return None
+    try:
+        choice = json.loads((Path(run) / SELECT_FILE).read_text())
+    except FileNotFoundError:
+        return None
+    mode = choice.get("select") if isinstance(choice, dict) else None
+    if mode == "latest":
+        return None
+    if mode == "base":
+        return "base"
+    if mode == "checkpoint" and isinstance(choice.get("checkpoint"), str) and isinstance(choice.get("sha256"), str):
+        return dict(checkpoint=choice["checkpoint"], sha256=choice["sha256"])
+    raise ValueError(f"Invalid {SELECT_FILE} in {run}; fix or delete it (no silent fallback)")
 
 
 class LivePolicy:
@@ -113,12 +140,16 @@ class LivePolicy:
             name = (Path(self.actor_path).name if self.actor_kind in ("editor_rl", "rl", "bc")
                     else self.actor_path)
             print(f"[rlt actor] serving {self.actor_kind}: {name} (behavior {self.behavior[:16]}) "
-                  + ("at startup" if rollout is None else f"from rollout {rollout}"), flush=True)
+                  + ("at startup" if rollout is None else f"from rollout {rollout}")
+                  + ("" if self.selection == "latest" else f" [operator-selected {self.selection}]")
+                  + (" [LINEAR editor: unbounded edit]" if getattr(getattr(self, "heads", None), "activation", "tanh") == "linear" else ""),
+                  flush=True)
         run = getattr(self, "run", None)
         if run is None:
             return
         record = dict(pid=os.getpid(), kind=self.actor_kind, checkpoint=str(self.actor_path),
-                      behavior=self.behavior, loaded=self._actor_since, checked=now, rollout=rollout)
+                      behavior=self.behavior, loaded=self._actor_since, checked=now, rollout=rollout,
+                      selection=self.selection, editor_activation=getattr(getattr(self, "heads", None), "activation", None))
         tmp = run / f"{ACTOR_FILE}.{os.getpid()}.tmp"
         try:
             tmp.write_text(json.dumps(record))
@@ -129,23 +160,27 @@ class LivePolicy:
     def _select_actor(self):
         root = Path(self.c["output"])
         latest = root / "learner/latest.json"
+        choice = selected_actor(getattr(self, "run", None))
+        self.selection = "latest" if choice is None else "base" if choice == "base" else "checkpoint"
         if is_editor(self.c):
-            if not latest.exists():
-                if (list((root / "learner").glob("step-*.pt"))
-                        or getattr(self, "actor_kind", None) == "editor_rl"):
+            if choice == "base" or choice is None and not latest.exists():
+                if choice is None and (list((root / "learner").glob("step-*.pt"))
+                                       or getattr(self, "actor_kind", None) == "editor_rl"):
                     raise ValueError("Editor learner publication missing; refuse zero-policy fallback")
-                if not hasattr(self, "heads"):
+                if not hasattr(self, "heads") or getattr(self, "actor_kind", None) != "editor_zero":
+                    # Fresh zero residual (a selected base must not keep served RL weights).
                     # Local seed scope: no effect on the frozen flow sampler RNG.
                     with torch.random.fork_rng(devices=[]):
                         torch.default_generator.manual_seed(self.c["seed"])
                         self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
+                self.heads.activation = "tanh"
                 self.actor_path, self.actor_kind = "zero-initialized residual editor", "editor_zero"
                 self.behavior = "editor_zero:" + self.c["contract_sha256"]
                 return
-            entry = json.loads(latest.read_text())
+            entry = choice or json.loads(latest.read_text())
             path = Path(entry["checkpoint"]).resolve()
             if path.parent != (root / "learner").resolve() or sha256(path) != entry["sha256"]:
-                raise ValueError("Invalid published editor checkpoint")
+                raise ValueError("Invalid " + ("selected" if choice else "published") + " editor checkpoint")
             saved = torch.load(path, map_location=self.device, weights_only=True)
             if saved["contract_sha256"] != self.c["contract_sha256"] or saved["token_sha256"] != self.token_sha:
                 raise ValueError("Editor actor/representation contract mismatch")
@@ -154,16 +189,22 @@ class LivePolicy:
             self.heads.load_state_dict(saved["learner"]["model"])
             if any(not torch.isfinite(v).all() for v in self.heads.state_dict().values()):
                 raise ValueError("Non-finite editor weights")
+            # Serve the edit exactly as it was trained (bounded tanh or linear).
+            activation = (saved.get("learner_options") or {}).get("editor_activation", "tanh")
+            if activation not in EDITOR_ACTIVATIONS:
+                raise ValueError(f"Unknown editor activation {activation!r} in {path.name}")
+            self.heads.activation = activation
             self.behavior = sha256(path)
             self.actor_path, self.actor_kind = str(path), "editor_rl"
             return
         path = root / "bc/best.pt"
         kind = "bc"
-        if latest.is_file():
-            entry = json.loads(latest.read_text())
+        entry = choice if isinstance(choice, dict) else (
+            json.loads(latest.read_text()) if choice is None and latest.is_file() else None)
+        if entry is not None:
             path = Path(entry["checkpoint"]).resolve()
             if path.parent != (root / "learner").resolve() or sha256(path) != entry["sha256"]:
-                raise ValueError("Invalid published learner checkpoint")
+                raise ValueError("Invalid " + ("selected" if choice else "published") + " learner checkpoint")
             kind = "rl"
         saved = torch.load(path, map_location=self.device, weights_only=True)
         if saved["contract_sha256"] != self.c["contract_sha256"] or saved["token_sha256"] != self.token_sha:
@@ -190,7 +231,7 @@ class LivePolicy:
         if writer is not None:
             writer.check()
         from vla_policy_bridge.pi05_fulltask import observation_to_inputs, INSTRUCTIONS
-        data = observation_to_inputs(observation, ego_only=is_focus(self.c))
+        data = observation_to_inputs(observation, ego_only=is_focus(self.c), wrist_velocity=is_wrist_velocity(self.c))
         phase = "p" + str(INSTRUCTIONS.index(data["prompt"]) + 1)
         if not is_shared(self.c) and phase != self.c["phase"]:
             raise ValueError(f"Server prepared for {self.c['phase']}, not {phase}; pause and select that phase's server")

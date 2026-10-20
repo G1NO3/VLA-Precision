@@ -33,13 +33,14 @@ def record(c):
     return r
 
 
-def test_focus_timing_revision_is_exact_and_preserves_contract(monkeypatch):
+@pytest.mark.parametrize("revision_name", ["FOCUS_TIMING_COMMIT", "FOCUS_HISTORY_COMMIT", "FOCUS_VELOCITY_COMMIT"])
+def test_focus_timing_revision_is_exact_and_preserves_contract(monkeypatch, revision_name):
     from pathlib import Path
     from vla_precision.gr00t_rlt import core
     path = Path(__file__).resolve().parents[1] / "configs/pipette_rl/pi05_fulltask_v6_focus_continuous.yaml"
     c = load_config(path)
     original = c['contract_sha256']
-    monkeypatch.setattr(core.subprocess, 'check_output', lambda *a, **kw: core.FOCUS_TIMING_COMMIT)
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda *a, **kw: getattr(core, revision_name))
     core.check_code(c)
     assert c['starvla_commit'] == core.FOCUS_BASE_COMMIT
     assert c['contract_sha256'] == original == 'c93f185f216b705eaeb74933f915ca04b8a6b95ed7f90ad4ea4a4e68795e8a9b'
@@ -108,3 +109,16 @@ def test_actor_envelope_preserves_frozen_channels():
         action=heads.act(torch.zeros(1,256),torch.zeros(1,59),reference)
     assert torch.all(action[...,heads.active]==2.2)
     assert torch.all(action[...,~heads.active]==7.)
+
+
+def test_wrist_velocity_recipe_accepts_only_the_v6d_serving_revision(monkeypatch):
+    from pathlib import Path
+    from vla_precision.gr00t_rlt import core
+    path = Path(__file__).resolve().parents[1] / "configs/pipette_rl/pi05_fulltask_v6d_focusvel_continuous_30hz.yaml"
+    c = load_config(path)
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda *a, **kw: core.FOCUS_VELOCITY_COMMIT)
+    core.check_code(c)
+    for older in (core.FOCUS_BASE_COMMIT, core.FOCUS_TIMING_COMMIT, core.FOCUS_HISTORY_COMMIT):
+        monkeypatch.setattr(core.subprocess, 'check_output', lambda *a, older=older, **kw: older)
+        with pytest.raises(ValueError, match='commit differs'):
+            core.check_code(c)

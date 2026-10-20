@@ -11,11 +11,15 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import time
 
 import numpy as np
 
 from vla_precision.gr00t_rlt.core import DEFAULT, check_code, digest, is_pi05, is_focus, load_config, sha256, validate_assets, validate_replay
 from vla_precision.gr00t_rlt.core import is_editor, is_async_editor, representation_sha
+from vla_precision.gr00t_rlt.core import STATIC_HUMAN, drop_static_human
+
+HUMAN_BATCH_FRACTION = .5
 
 
 def write_json(path, value):
@@ -208,6 +212,21 @@ def fit_token(c, args):
                checkpoint_sha256=sha256(out / "best.pt"), live_enabled=False))
 
 
+def sample_batch(rng, n, batch_size, phase_rows, human_rows, n_human):
+    """Window ids for one update: batch_size - n_human phase-stratified (equal
+    expected mass per observed phase, not per video length; uniform without
+    phases), then n_human from human_rows (per-phase groups of windows with
+    human BC rows), group-stratified. n_human = 0 draws exactly as before."""
+    ids = rng.integers(n, size=batch_size - n_human)
+    if phase_rows is not None:
+        choices = rng.integers(len(phase_rows), size=batch_size - n_human)
+        ids = np.asarray([rng.choice(phase_rows[i]) for i in choices])
+    if n_human:
+        picks = rng.integers(len(human_rows), size=n_human)
+        ids = np.concatenate([ids, [rng.choice(human_rows[i]) for i in picks]]).astype(np.int64)
+    return ids
+
+
 def fit_heads(c, args):
     import torch
     from vla_precision.gr00t_rlt.model import Learner
@@ -229,8 +248,30 @@ def fit_heads(c, args):
         data = {k: f[k].copy() for k in f.files}
     r, d = validate_replay(data, meta, c, token_sha256=rep_sha)
     data.update(reward=r, discount=d)
+    if is_async_editor(c):
+        # After load_config hashed the recipe: contract_sha256 is unchanged;
+        # learner_options in the checkpoint records the filter used.
+        static = None if getattr(args, "keep_static_human", False) else dict(STATIC_HUMAN)
+        if static is not None and "action_half_range" not in c:
+            print("[learner] human static filter skipped: no action statistics", flush=True)
+            static = None
+        c["learner"]["human_static_filter"] = static
+        if static is not None:
+            counts = drop_static_human(data, c["action_half_range"], c["scheduler"]["action_hz"], **static)
+            print(json.dumps(dict(human_static_filter=static, **counts)), flush=True)
     torch.manual_seed(c["seed"])
     rng = np.random.default_rng(c["seed"])
+    if is_editor(c):
+        # Post-hash learner option (contract unchanged); a resumed run keeps its
+        # checkpoint's activation unless one is asked for explicitly.
+        asked = getattr(args, "editor_activation", None)
+        if args.resume:
+            saved_options = torch.load(args.resume, map_location="cpu", weights_only=True).get("learner_options") or {}
+            inherited = saved_options.get("editor_activation", "tanh")
+            if asked is not None and asked != inherited:
+                raise ValueError(f"Resume checkpoint uses a {inherited} editor; cannot continue it as {asked}")
+            asked = inherited
+        c["learner"]["editor_activation"] = asked or "tanh"
     learner = Learner(c, args.device)
     if args.resume:
         previous = torch.load(args.resume, map_location=args.device, weights_only=True)
@@ -241,12 +282,29 @@ def fit_heads(c, args):
         if args.device.startswith("cuda"):
             torch.cuda.set_rng_state_all([s.cpu() for s in previous["cuda_rng"]])
         rng.bit_generator.state = previous["numpy_rng"]
+        if learner.anchor is not None:
+            c["learner"]["reference_anchor"] = (previous.get("learner_options") or {}).get("reference_anchor")
     elif not is_editor(c):
         warm = torch.load(Path(c["output"]) / "bc/best.pt", map_location=args.device, weights_only=True)
         if warm["contract_sha256"] != c["contract_sha256"] or warm["token_sha256"] != sha256(token):
             raise ValueError("BC warm-start contract/token mismatch")
         learner.model.actor.load_state_dict(warm["actor"])
         learner.target.load_state_dict(learner.model.state_dict())
+    anchor = getattr(args, "reference_anchor", None)
+    if anchor is not None:
+        # Post-hash learner option (contract unchanged): the reference loss pulls
+        # non-human rows towards this editor's output instead of pi0.5's.
+        if not is_editor(c):
+            raise ValueError("--reference-anchor needs a direct editor")
+        saved = torch.load(anchor, map_location=args.device, weights_only=True)
+        if saved["contract_sha256"] != c["contract_sha256"] or saved["token_sha256"] != rep_sha:
+            raise ValueError("Reference anchor contract/token mismatch")
+        kind = (saved.get("learner_options") or {}).get("editor_activation", "tanh")
+        if kind != c["learner"]["editor_activation"]:
+            raise ValueError(f"Reference anchor is a {kind} editor; this run is {c['learner']['editor_activation']}")
+        learner.set_anchor(saved["learner"]["model"])
+        c["learner"]["reference_anchor"] = dict(checkpoint=str(anchor), sha256=sha256(anchor), step=saved["learner"]["step"])
+        print(json.dumps(dict(reference_anchor=c["learner"]["reference_anchor"])), flush=True)
     out = Path(c["output"]) / "learner"
     out.mkdir(parents=True, exist_ok=True)
     if ((out / "latest.json").exists() or (is_editor(c) and list(out.glob("step-*.pt")))) and not args.resume:
@@ -266,6 +324,23 @@ def fit_heads(c, args):
         keys += ("phase", "next_phase")
         phase_rows = [np.flatnonzero(data["phase"] == p) for p in np.unique(data["phase"])]
     batch_size = c["learner"]["batch_size"]
+    # Human quota (borrowed from jm_pipette's sampler): a fixed share of every
+    # batch comes from windows that still carry human BC rows (after the static
+    # filter), phase-stratified like the rest. 0 = the old sampler, draw for draw.
+    quota = getattr(args, "human_batch_fraction", None)
+    quota = HUMAN_BATCH_FRACTION if quota is None else float(quota)
+    if not 0 <= quota < 1:
+        raise ValueError("human batch fraction must be in [0, 1)")
+    c["learner"]["human_batch_fraction"] = quota   # after hashing: contract unchanged, checkpoint records it
+    has_human = (data["human"] & data["bc_eligible"] & data["valid"]).any((1, 2))
+    if is_shared(c):
+        human_rows = [rows[has_human[rows]] for rows in phase_rows]
+        human_rows = [rows for rows in human_rows if len(rows)]
+    else:
+        human_rows = [np.flatnonzero(has_human)] if has_human.any() else []
+    n_human = int(round(quota * batch_size)) if human_rows else 0
+    if quota and not human_rows:
+        print("[learner] human batch quota skipped: no human BC windows", flush=True)
     if progress:
         progress.stage("train", updates_done=0, updates_total=updates, batch_size=batch_size,
                        dataset_transitions=len(r), samples_seen=0, start_step=learner.step,
@@ -274,16 +349,13 @@ def fit_heads(c, args):
     for done in range(1, updates + 1):
         if getattr(args, "replay_check", None):
             args.replay_check()
-        ids = rng.integers(len(r), size=c["learner"]["batch_size"])
-        if is_shared(c):
-            # Equal expected mass for each observed phase, not each video length.
-            choices = rng.integers(len(phase_rows), size=c["learner"]["batch_size"])
-            ids = np.asarray([rng.choice(phase_rows[i]) for i in choices])
+        ids = sample_batch(rng, len(r), batch_size, phase_rows if is_shared(c) else None, human_rows, n_human)
         batch = {k: torch.as_tensor(data[k][ids], device=args.device,
                                    dtype=torch.bool if data[k].dtype == np.bool_ else torch.float32) for k in keys}
         metrics = learner.update(batch)
         if is_shared(c):
             metrics["phase_samples"] = {f"p{i+1}": int((data["phase"][ids] == i).sum()) for i in range(5)}
+        metrics["human_windows"] = int(has_human[ids].sum())
         with (out / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(metrics, allow_nan=False) + "\n")
         if learner.step % 10 == 0:
@@ -302,7 +374,14 @@ def fit_heads(c, args):
                     learner_options=dict(c["learner"]),  # as trained (CLI overrides included)
                     live_enabled=False), tmp)
     tmp.replace(dest)
-    write_json(out / "latest.json", dict(checkpoint=str(dest), sha256=sha256(dest), live_enabled=False))
+    digest_ = sha256(dest)
+    # One learner run = one round. Stdlib-readable record for the console's
+    # served-actor selector (gui/rlt_panel.py); the .pt stays the authority.
+    write_json(dest.with_suffix(".json"), dict(
+        step=learner.step, start_step=learner.step - updates, updates=updates, sha256=digest_,
+        episodes=len(meta["episodes"]) if "episodes" in meta else None, transitions=int(len(r)), snapshot=str(args.replay),
+        created=time.time()))
+    write_json(out / "latest.json", dict(checkpoint=str(dest), sha256=digest_, live_enabled=False))
     if progress:
         progress.update(force=True, checkpoint=str(dest))
 

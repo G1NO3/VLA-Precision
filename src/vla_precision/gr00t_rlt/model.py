@@ -104,6 +104,13 @@ class EditorHeads(Heads):
             self.actor = mlp(c["token"]["embed_dim"] + c["state_dim"] + self.h*self.full + 5, self.h*self.d)
             self.register_buffer("phase_masks", torch.tensor([phase_active(c, f"p{i+1}") for i in range(5)], dtype=torch.bool))
         self.scale = float(c["editor"]["residual_scale"])
+        # "tanh" (recipe): edit bounded by +/-scale. "linear" (learner option,
+        # operator 2026-10-19): scale is only the output gain, the edit is
+        # unbounded and the edited action is clamped to the action range.
+        # Not part of the state dict: serving takes it from the checkpoint.
+        self.activation = c.get("learner", {}).get("editor_activation", "tanh")
+        if self.activation not in EDITOR_ACTIVATIONS:
+            raise ValueError(f"editor_activation must be one of {EDITOR_ACTIVATIONS}")
         nn.init.zeros_(self.actor[-1].weight)
         nn.init.zeros_(self.actor[-1].bias)
         qdim = c["token"]["embed_dim"] + c["state_dim"] + self.h * (self.full + 2*self.d) + self.phase_dim
@@ -130,9 +137,13 @@ class EditorHeads(Heads):
     def act(self, z, state, reference, *, dropout=0.0, phase=None):
         if dropout:
             raise ValueError("Editor cannot drop its reference action")
-        delta = self.scale * self.actor(torch.cat([self._phase_features(phase, z), state, reference.flatten(1)], -1)).tanh()
-        delta = delta.reshape(-1, self.h, self.d)
-        return reference[..., :self.d] + torch.where(self.active_for(phase), delta, torch.zeros_like(delta))
+        out = self.actor(torch.cat([self._phase_features(phase, z), state, reference.flatten(1)], -1))
+        delta = (self.scale * (out if self.activation == "linear" else out.tanh())).reshape(-1, self.h, self.d)
+        return self._edited(reference[..., :self.d], delta, phase)
+
+    def _edited(self, ref, delta, phase):
+        action = ref + torch.where(self.active_for(phase), delta, torch.zeros_like(delta))
+        return action.clamp(-ACTION_RANGE, ACTION_RANGE) if self.activation == "linear" else action
 
     def q(self, z, state, reference, action, valid, context=None, *, phase=None):
         x = torch.cat([self._phase_features(phase, z), state, reference.flatten(1), (action*valid).flatten(1), valid.float().flatten(1)], -1)
@@ -140,8 +151,14 @@ class EditorHeads(Heads):
 
     def smooth_action(self, action, reference, noise, *, phase=None):
         ref = reference[..., :self.d]
-        delta = (action + noise - ref).clamp(-self.scale, self.scale)
-        return ref + torch.where(self.active_for(phase), delta, torch.zeros_like(delta))
+        delta = action + noise - ref
+        if self.activation == "tanh":
+            delta = delta.clamp(-self.scale, self.scale)
+        return self._edited(ref, delta, phase)
+
+
+EDITOR_ACTIVATIONS = ("tanh", "linear")
+ACTION_RANGE = 2.2   # normalized action clamp (Heads.smooth_action)
 
 
 def make_heads(c):
@@ -159,6 +176,32 @@ def supervised_losses(prediction, action, reference, human, eligible, valid):
     return human_loss, reference_loss, hmask.sum(), rmask.sum()
 
 
+def term_gradients(params, terms):
+    """Per-term gradients of the actor objective, {name: [grad per param]}.
+    Their sum is exactly the gradient of sum(terms) (what backward() gave)."""
+    params = list(params)
+    names = list(terms)
+    out = {}
+    for i, name in enumerate(names):
+        grads = torch.autograd.grad(terms[name], params, retain_graph=i < len(names) - 1, allow_unused=True)
+        out[name] = [torch.zeros_like(p) if g is None else g for p, g in zip(params, grads)]
+    return out
+
+
+def gradient_stats(grads):
+    """Norm of each term's gradient and the cosine between each pair (0 when a
+    term has no gradient), for the actor's BC / reference / Q tug of war."""
+    flat = {k: torch.cat([g.reshape(-1) for g in v]) for k, v in grads.items()}
+    norms = {k: float(v.norm()) for k, v in flat.items()}
+    stats = {f"grad_norm_{k}": n for k, n in norms.items()}
+    names = list(flat)
+    for i, a in enumerate(names):
+        for b in names[i+1:]:
+            den = norms[a] * norms[b]
+            stats[f"grad_cos_{a}_{b}"] = float(flat[a] @ flat[b]) / den if den > 0 else 0.0
+    return stats
+
+
 def supervised_loss(prediction, action, reference, human, eligible, valid, options):
     human_loss, reference_loss, _, _ = supervised_losses(prediction, action, reference, human, eligible, valid)
     return options["human_bc_weight"] * human_loss + options["reference_weight"] * reference_loss
@@ -174,6 +217,15 @@ class Learner:
         self.qo = torch.optim.Adam(self.model.critics.parameters(), lr=self.options["critic_lr"])
         self.step = 0
         self.critic_updates = 0
+        self.anchor = None
+
+    def set_anchor(self, model_state):
+        """Reference-loss target = a frozen copy of another editor (e.g. the best
+        served round) instead of the frozen pi0.5 reference: a trust region
+        around that editor (operator 2026-10-20). None = the plain reference."""
+        self.anchor = copy.deepcopy(self.model).requires_grad_(False)
+        self.anchor.load_state_dict(model_state)
+        self.anchor.activation = self.model.activation
 
     def update(self, b):
         o = self.options
@@ -194,7 +246,7 @@ class Learner:
             raise FloatingPointError("Non-finite critic loss")
         self.qo.zero_grad()
         qloss.backward()
-        nn.utils.clip_grad_norm_(self.model.critics.parameters(), o["max_grad_norm"], error_if_nonfinite=True)
+        critic_norm = float(nn.utils.clip_grad_norm_(self.model.critics.parameters(), o["max_grad_norm"], error_if_nonfinite=True))
         if td.any():
             self.qo.step()
             self.critic_updates += 1
@@ -203,13 +255,18 @@ class Learner:
                    "q2_loss": float((errors[:, 1]*td).sum().detach()/td.sum().clamp(min=1)),
                    "td_samples": int(td.sum()),
                    "critic_updates": self.critic_updates,
-                   "target_q": float(target.mean()), "actor_updated": False}
+                   "target_q": float(target.mean()), "actor_updated": False,
+                   "critic_grad_norm": critic_norm, "critic_grad_clipped": critic_norm > o["max_grad_norm"]}
         if self.step % o["actor_update_interval"] == 0:
             self.model.critics.requires_grad_(False)
             try:
                 pred = self.model.act(z, state, ref, dropout=o["reference_dropout"], phase=b.get("phase"))
+                anchor = ref
+                if self.anchor is not None:
+                    with torch.no_grad():
+                        anchor = self.anchor.act(z, state, ref, phase=b.get("phase"))
                 human_loss, ref_loss, nh, nr = supervised_losses(
-                    pred, b["action"], ref, b["human"], b["bc_eligible"], b["valid"])
+                    pred, b["action"], anchor, b["human"], b["bc_eligible"], b["valid"])
                 bc = o["human_bc_weight"] * human_loss + o["reference_weight"] * ref_loss
                 qvalues = self.model.q(z, state, ref, pred, b["valid"], b.get("scheduler_context"), phase=b.get("phase"))[:, 0]
                 qpi = (qvalues * td).sum() / td.sum().clamp(min=1)
@@ -218,9 +275,17 @@ class Learner:
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite actor loss")
                 self.ao.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model.actor.parameters(), o["max_grad_norm"], error_if_nonfinite=True)
+                # One gradient per term (summed = loss.backward()), so the log
+                # shows which of BC / reference / Q drives the actor.
+                params = list(self.model.actor.parameters())
+                grads = term_gradients(params, dict(bc=o["human_bc_weight"] * human_loss,
+                                                    ref=o["reference_weight"] * ref_loss, rl=-weight * qpi))
+                for i, p in enumerate(params):
+                    p.grad = sum(g[i] for g in grads.values())
+                actor_norm = float(nn.utils.clip_grad_norm_(params, o["max_grad_norm"], error_if_nonfinite=True))
                 self.ao.step()
+                metrics.update(gradient_stats(grads), actor_grad_norm=actor_norm,
+                               actor_grad_clipped=actor_norm > o["max_grad_norm"])
                 metrics.update(actor_updated=True, actor_loss=float(loss.detach()),
                     bc_loss=float(human_loss.detach()), human_bc_loss=float(human_loss.detach()),
                     ref_loss=float(ref_loss.detach()), reference_loss=float(ref_loss.detach()),
@@ -237,6 +302,8 @@ class Learner:
                                    editor_delta_max_abs=float(delta.abs().max()),
                                    editor_saturation_fraction=float((delta.abs() >= .99*self.model.scale).float().mean()),
                                    editor_human_outside_fraction=float((outside & human_mask).sum()/human_mask.sum().clamp(min=1)))
+                    if self.anchor is not None:
+                        metrics["anchor_gap_mean_abs"] = float((pred - anchor).detach().abs().mean())
             finally:
                 self.model.critics.requires_grad_(True)
             with torch.no_grad():
@@ -247,7 +314,8 @@ class Learner:
     def state_dict(self):
         return dict(model=self.model.state_dict(), target=self.target.state_dict(),
                     actor_optimizer=self.ao.state_dict(), critic_optimizer=self.qo.state_dict(),
-                    step=self.step, critic_updates=self.critic_updates)
+                    step=self.step, critic_updates=self.critic_updates,
+                    **({} if self.anchor is None else dict(anchor=self.anchor.state_dict())))
 
     def load_state_dict(self, value):
         self.model.load_state_dict(value["model"])
@@ -256,3 +324,6 @@ class Learner:
         self.qo.load_state_dict(value["critic_optimizer"])
         self.step = value["step"]
         self.critic_updates = value.get("critic_updates", self.step)
+        self.anchor = None
+        if "anchor" in value:
+            self.set_anchor(value["anchor"])

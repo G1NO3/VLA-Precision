@@ -89,11 +89,23 @@ class Replay:
     def counts(self):
         return dict(self.db.execute("SELECT outcome,COUNT(*) FROM episodes GROUP BY outcome"))
 
-    def export(self, c, token_sha256, dest, progress=None):
+    def export(self, c, token_sha256, dest, progress=None, *, full_chunk_human=True, behaviors=None):
         """``progress(**counts)``, optional: called per transition read (the
-        caller throttles) and once before the snapshot is written."""
+        caller throttles) and once before the snapshot is written.
+
+        ``full_chunk_human`` (async editor): relabel every takeover window's
+        whole 30-row chunk from its own AND the following windows' published
+        human commands (vla_policy_bridge.editor_labels), instead of only the
+        ~5 rows the recorder could see. The recorder's labels must come out
+        identical, or the export refuses.
+
+        ``behaviors``: optional behavior identities (the served actor's sha256)
+        to export only the episodes those actors collected."""
         from .core import validate_replay, is_async_editor, is_shared
         report = progress or (lambda **counts: None)
+        full_chunk_human = bool(full_chunk_human and is_async_editor(c))
+        if full_chunk_human:
+            relabel = dict(recorded=0, labelled=0, windows=0)
         if token_sha256.startswith("bootstrap:"):
             raise ValueError("Bootstrap replay needs a trained token and encode-bootstrap before RL export")
         rows, ids = [], []
@@ -104,6 +116,10 @@ class Replay:
             self.db.execute("BEGIN")
             scope = "contract=?" if is_shared(c) else "phase=? AND contract=?"
             args = [c["contract_sha256"], token_sha256] if is_shared(c) else [c["phase"], c["contract_sha256"], token_sha256]
+            if behaviors is not None:
+                behaviors = sorted(set(behaviors))
+                scope += " AND behavior IN (" + ",".join("?"*len(behaviors)) + ")"
+                args[-1:-1] = behaviors
             episodes = self.db.execute("SELECT id,outcome,terminal_ns,phase FROM episodes WHERE " + scope +
                 " AND token=? AND outcome IN ('success','failure') ORDER BY created", args).fetchall()
             for n, (eid, outcome, stamp, start_phase) in enumerate(episodes):
@@ -136,6 +152,8 @@ class Replay:
                     report(step="read", episodes_done=n, episodes_total=len(episodes),
                            transitions=len(rows)+len(episode_rows),
                            observations_checked=len(capture_checked))
+                if full_chunk_human and any(np.any(r.get("publication_human", False)) for r in episode_rows):
+                    self._full_chunk_human(episode_rows, c, relabel)
                 if is_shared(c):
                     # An episode may begin at any phase, but cannot splice
                     # independently reset phases or earn skipped milestones.
@@ -176,6 +194,8 @@ class Replay:
                 "terminal_ns", "outcome", "episode_outcome")
         if is_async_editor(c):
             keys += ("scheduler_context", "next_scheduler_context", "proposal_accepted", "autonomy", "next_autonomy")
+            if all("observation_file" in r and "next_observation_file" in r for r in rows):
+                keys += ("observation_file", "next_observation_file")   # PI05 head training re-reads the prefix
         if is_shared(c):
             keys += ("phase", "next_phase", "phase_reward_ns")
         data = {k: np.stack([r[k] for r in rows]) for k in keys}
@@ -184,7 +204,12 @@ class Replay:
                     completed_episodes_only=True, episodes=ids, collector="bridge_sequential_v1",
                     human_td="excluded_controller_mismatch", action_evidence="bridge_published_not_motor_ack")
         if is_async_editor(c):
-            meta.update(collector="bridge_async_act_v1", action_evidence="requested_chunk_not_act_blend")
+            meta.update(collector="bridge_async_act_v1", action_evidence="requested_chunk_not_act_blend",
+                        human_labels="full_chunk_following_windows_v1" if full_chunk_human else "recorder_own_window_v1")
+            if full_chunk_human:
+                meta["human_relabel"] = relabel
+        if behaviors is not None:
+            meta["behavior_filter"] = behaviors
         if is_shared(c):
             meta.update(episode_start_phases=start_phases,
                         fulltask_success_episodes=fulltask_successes,
@@ -197,7 +222,33 @@ class Replay:
         with dest.open("xb") as f:
             np.savez_compressed(f, **data)
         dest.with_suffix(".json").write_text(json.dumps(meta, indent=2)+"\n")
-        return dict(episodes=len(ids), transitions=len(rows), path=str(dest))
+        return dict(episodes=len(ids), transitions=len(rows), path=str(dest),
+                    **({"human_relabel": relabel} if full_chunk_human else {}))
+
+    def _full_chunk_human(self, episode_rows, c, counts):
+        """Relabel the takeover windows of one episode in place (see export)."""
+        from vla_policy_bridge.editor_labels import episode_labels
+        if not hasattr(self, "_label_kin"):
+            from vla_policy_bridge.pico_intervention import UrdfKinematics, URDF, ARM_SIDES
+            self._label_kin = {s: UrdfKinematics(URDF, target_link=link, arm_slice=sl) for s, (link, sl) in ARM_SIDES.items()}
+        kin = self._label_kin
+        windows = []
+        for row in episode_rows:
+            with np.load(self.root / str(row["observation_file"].item()), allow_pickle=False) as f:
+                raw = f["physical_state"].copy()
+            windows.append(dict(start_ns=int(row["start_ns"]), raw=raw, active=row["valid"][0],
+                                ns=row["publication_ns"], q=row["published_q29"], hands=row["publication_hands"],
+                                human=row["publication_human"], eligible=row["publication_eligible"]))
+        labels = episode_labels(windows, kin, c["action_q01"], c["action_q99"], c["scheduler"]["action_hz"])
+        for row, (values, mask) in zip(episode_rows, labels):
+            if not row["publication_human"].any():
+                continue   # autonomous windows keep the proposal (TD / reference rows)
+            old = row["human"]
+            if (old & ~mask).any() or (old.any() and np.abs(values[old] - row["action"][old]).max() > 1e-4):
+                raise ValueError("Full-chunk human labels disagree with the recorder's labels")
+            row["action"] = np.where(mask, values, row["action"]).astype(row["action"].dtype)
+            row["human"], row["bc_eligible"] = mask.copy(), mask.copy()   # as the recorder: no reference rows
+            counts["recorded"] += int(old.sum()); counts["labelled"] += int(mask.sum()); counts["windows"] += 1
 
     def close(self):
         self.db.close()

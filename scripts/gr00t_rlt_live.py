@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-from vla_precision.gr00t_rlt.core import DEFAULT, load_config, sha256, is_editor, representation_sha
+from vla_precision.gr00t_rlt.core import DEFAULT, load_config, sha256, is_editor, representation_sha, is_wrist_velocity
 from vla_precision.gr00t_rlt.replay import Replay
 
 #: the running train/initialize command's progress file (see gr00t_rlt.progress)
@@ -30,8 +30,37 @@ def main():
                    help="train only: override learner.reference_weight for this run (the recipe's "
                         "contract hash, hence replay and serving compatibility, is unchanged; "
                         "the checkpoint records the options used)")
+    p.add_argument("--keep-static-human", action="store_true",
+                   help="train only: keep held (non-moving) human takeover rows in human BC; by default "
+                        "only rows where the operator's command moves are trained (contract unchanged)")
+    p.add_argument("--human-batch-fraction", type=float, default=None,
+                   help="train only: share of each batch drawn from windows with human BC rows "
+                        "(default 0.5; 0 = old phase-stratified sampler; contract unchanged)")
+    p.add_argument("--q-weight", type=float, default=None,
+                   help="train only: override learner.q_weight for this run; 0 = HG-DAgger-style (human BC + "
+                        "reference only, the critic still trains but never moves the actor; contract unchanged)")
+    p.add_argument("--editor-activation", choices=("tanh", "linear"), default=None,
+                   help="train only: 'linear' removes the editor's tanh bound (residual_scale becomes the output "
+                        "gain; edited actions are clamped to +/-2.2). Default: tanh, or the resumed checkpoint's")
+    p.add_argument("--reference-anchor", type=Path, default=None,
+                   help="train only: an editor checkpoint whose output replaces the frozen pi0.5 reference as the "
+                        "reference-loss target (a trust region around e.g. the best round; contract unchanged; "
+                        "a resumed anchored run keeps its anchor)")
+    p.add_argument("--collected-by", type=Path, action="append", default=None,
+                   help="export/train: only episodes served by this actor checkpoint (sha256 match); repeatable")
+    p.add_argument("--recorder-human-labels", action="store_true",
+                   help="export/train: keep only the ~5 human label rows the recorder saw per window, instead of "
+                        "labelling the whole chunk from the following windows' human commands (default)")
     p.add_argument("--smoke-test", action="store_true", help="Load and infer with synthetic observation; no socket or robot")
     a = p.parse_args()
+    if a.editor_activation is not None and a.command != "train":
+        p.error("--editor-activation applies to train only")
+    if a.human_batch_fraction is not None and (a.command != "train" or not 0 <= a.human_batch_fraction < 1):
+        p.error("--human-batch-fraction applies to train only, in [0, 1)")
+    if a.reference_anchor is not None and (a.command != "train" or not a.reference_anchor.is_file()):
+        p.error("--reference-anchor applies to train only and must be an existing checkpoint")
+    if a.keep_static_human and a.command != "train":
+        p.error("--keep-static-human applies to train only")
     if a.bootstrap and a.command != "serve":
         p.error("--bootstrap is only valid for serve")
     if a.updates < 1:
@@ -47,6 +76,11 @@ def main():
         c["learner"]["reference_weight"] = float(a.reference_weight)
         print(f"[learner] reference_weight {a.reference_weight:g} for this run "
               f"(recipe {recipe:g}); contract unchanged", flush=True)
+    if a.q_weight is not None:
+        if a.command != "train" or not 0 <= a.q_weight <= 10:
+            p.error("--q-weight applies to train only, in [0, 10]")
+        print(f"[learner] q_weight {a.q_weight:g} for this run (recipe {c['learner']['q_weight']:g}); contract unchanged", flush=True)
+        c["learner"]["q_weight"] = float(a.q_weight)   # after load_config hashed the recipe
     if is_editor(c) and (a.bootstrap or a.command in ("initialize", "check-bootstrap")):
         p.error("Direct editor starts from a zero residual; no token/BC/bootstrap initialization")
     if a.checkpoint is not None and a.checkpoint.resolve() != Path(c["checkpoint"]).resolve():
@@ -59,13 +93,14 @@ def main():
         return
     if a.command == "check-live":
         from vla_precision.gr00t_rlt.serving import check_live_weights
-        print(json.dumps(check_live_weights(c)))
+        print(json.dumps(check_live_weights(c, a.run)))
         return
     if a.command == "serve":
         if c.get("focus", {}).get("enabled"):
-            if not a.focus_camera:
+            if not a.focus_camera and not a.smoke_test:
                 p.error("FOCUS serve requires --focus-camera (same ego stream as Bridge)")
-            c["focus_camera"] = a.focus_camera
+            c["focus_camera"] = None if a.smoke_test else a.focus_camera
+            c["offline_smoke_test"] = a.smoke_test
         from vla_precision.gr00t_rlt.serving import LivePolicy
         from deployment.model_server.tools.zmq_policy_server import ZmqGr00tPolicyServer
         from vla_policy_bridge.pi05_fulltask import synthetic_observation, INSTRUCTIONS
@@ -73,6 +108,9 @@ def main():
         server = None
         try:
             obs = synthetic_observation()
+            if is_wrist_velocity(c):
+                import numpy as np
+                obs["state"]["wrist_vel"] = np.zeros((1, 1, 6), np.float32)
             if c.get("focus", {}).get("enabled"):
                 import numpy as np
                 obs["video"] = {"rgb": np.zeros((1, 1, 720, 1280, 3), np.uint8)}
@@ -167,7 +205,9 @@ def main():
             PROGRESS.stage("export", snapshot=str(path))
         try:
             exported = db.export(c, representation_sha(c), path,
-                                 progress=PROGRESS.update if PROGRESS else None)
+                                 progress=PROGRESS.update if PROGRESS else None,
+                                 full_chunk_human=not a.recorder_human_labels,
+                                 behaviors=None if a.collected_by is None else [sha256(x) for x in a.collected_by])
             print(json.dumps(exported))
         finally:
             db.close()
@@ -200,7 +240,10 @@ def main():
                 replay_check()
                 cli.fit_heads(c, SimpleNamespace(device=a.device, updates=a.updates, replay=path,
                                                 resume=resume, replay_check=replay_check,
-                                                progress=PROGRESS))
+                                                progress=PROGRESS, keep_static_human=a.keep_static_human,
+                                                human_batch_fraction=a.human_batch_fraction,
+                                                editor_activation=a.editor_activation,
+                                                reference_anchor=a.reference_anchor))
             finally:
                 audit.close()
             PROGRESS.finish()

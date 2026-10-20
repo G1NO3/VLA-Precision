@@ -42,7 +42,7 @@ class FrozenGR00TFeatures:
     """Single-owner offline extractor. Capture the exact features used for reference.
 
     It deliberately does not expose a robot action publisher or async inference.
-    Inputs use the prepared dataset's RGB arrays and physical state59.
+    Inputs use RGB arrays and the recipe's physical state vector.
     """
     def __init__(self, c, device="cuda"):
         sys.path.insert(0, c["starvla_root"])
@@ -54,15 +54,15 @@ class FrozenGR00TFeatures:
         self.model.requires_grad_(False).eval()
         self.model._freeze_backbone = True
         self.proc = self.wrapper.get_norm_processor()
-        if sum(self.proc.state_key_dims.values()) != 59 or sum(self.proc.action_key_dims.values()) != 32:
+        if sum(self.proc.state_key_dims.values()) != c["state_dim"] or sum(self.proc.action_key_dims.values()) != 32:
             raise ValueError("GR00T serving processor has unexpected layout")
 
     @torch.inference_mode()
     def extract(self, sample):
         started = time.perf_counter()
         raw_state = np.asarray(sample["observation.state"], np.float32)
-        if raw_state.shape != (59,) or not np.isfinite(raw_state).all():
-            raise ValueError("Expected finite physical state59")
+        if raw_state.shape != (self.c["state_dim"],) or not np.isfinite(raw_state).all():
+            raise ValueError(f"Expected finite physical state{self.c['state_dim']}")
         images = [sample[f"observation.images.{view}"] for view in self.c["views"]]
         if any(im.ndim != 3 or im.shape[-1] != 3 or im.dtype != np.uint8 for im in images):
             raise ValueError("Expected uint8 RGB images, not BGR")
@@ -128,10 +128,10 @@ class FrozenGR00TFeatures:
 
 
 class FrozenPI05Features(FrozenGR00TFeatures):
-    """PI05 v5: capture final PaliGemma prefix and its real padding/view mask.
+    """Capture the final PI05 PaliGemma prefix and its real padding/view mask.
 
-    The frozen reference receives NO state, exactly like the BC server. The
-    normalized physical state59 remains an explicit input to the new RL head.
+    The frozen reference matches the BC server: no state for v5/v6, measured
+    velocity6 for v6d. The RL head receives the full normalized state59/state65.
     Missing right-wrist images stay masked; do not pool black-image tokens.
     """
     def __init__(self, c, device="cuda"):
@@ -141,7 +141,26 @@ class FrozenPI05Features(FrozenGR00TFeatures):
             tokenizer.model_path = str((Path(c["starvla_root"]) / tokenizer.model_path).resolve(strict=True))
 
     def _predict_capture(self, example):
-        example = {k: v for k, v in example.items() if k != "state"}
+        from .core import is_wrist_velocity
+        if is_wrist_velocity(self.c):
+            if self.proc.state_input_keys != ["state.wrist_vel"]:
+                raise ValueError("v6d checkpoint must select wrist velocity as model state")
+            offset = 0
+            for key in self.proc.state_keys:
+                width = self.proc.state_key_dims[key]
+                if key == "state.wrist_vel":
+                    # The actor/replay retain all 65 normalized values. Only velocity6
+                    # goes into PI05's prompt, packed exactly like native IL serving.
+                    model_state = np.asarray(example["state"], np.float32)[offset:offset+width]
+                    break
+                offset += width
+            else:
+                raise ValueError("Missing wrist velocity in the serving state layout")
+            if model_state.shape != (6,) or not np.isfinite(model_state).all():
+                raise ValueError("Expected finite normalized wrist velocity6")
+            example = {**example, "state": model_state.astype(np.float16).astype(np.float32)}
+        else:
+            example = {k: v for k, v in example.items() if k != "state"}
         captured = {}
         embed, forward = self.model.embed_prefix, self.model.vlm.forward_prefix
 
@@ -176,7 +195,7 @@ class FrozenFocusFeatures(FrozenPI05Features):
         super().__init__(c, device)
         from deployment.model_server.focus_view import FocusViewSynth
         camera = c.get("focus_camera")
-        if not camera:
+        if not camera and not c.get("offline_smoke_test", False):
             raise ValueError("FOCUS live extraction requires --focus-camera for the ego stream")
         self.focus = FocusViewSynth(sam=c["focus"]["sam"], device=device,
                                    camera=camera, rate_hz=c["focus"]["rate_hz"])
