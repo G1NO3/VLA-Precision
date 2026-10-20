@@ -265,13 +265,20 @@ def fit_heads(c, args):
         # Post-hash learner option (contract unchanged); a resumed run keeps its
         # checkpoint's activation unless one is asked for explicitly.
         asked = getattr(args, "editor_activation", None)
+        phases = getattr(args, "editor_phases", None)
+        phases = sorted(phases) if phases else None
         if args.resume:
             saved_options = torch.load(args.resume, map_location="cpu", weights_only=True).get("learner_options") or {}
             inherited = saved_options.get("editor_activation", "tanh")
             if asked is not None and asked != inherited:
                 raise ValueError(f"Resume checkpoint uses a {inherited} editor; cannot continue it as {asked}")
             asked = inherited
+            if phases is not None and phases != saved_options.get("editor_phases"):
+                raise ValueError(f"Resume checkpoint edits {saved_options.get('editor_phases') or 'every phase'}; "
+                                 f"cannot continue it as {phases}")
+            phases = saved_options.get("editor_phases")
         c["learner"]["editor_activation"] = asked or "tanh"
+        c["learner"]["editor_phases"] = phases      # None = every phase (post-hash; contract unchanged)
     learner = Learner(c, args.device)
     if args.resume:
         previous = torch.load(args.resume, map_location=args.device, weights_only=True)

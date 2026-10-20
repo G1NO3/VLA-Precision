@@ -360,3 +360,61 @@ def test_linear_editor_is_unbounded_but_clamped_to_the_action_range_and_tanh_is_
     assert make_heads(c2).activation == "linear"
     with pytest.raises(ValueError, match="editor_activation"):
         make_heads(dict(c, learner=dict(c["learner"], editor_activation="relu")))
+
+
+def test_editor_phases_edit_only_there_and_supervise_only_there(tmp_path):
+    c = load_config(CONTINUOUS, "p1", workspace=tmp_path)
+    c["learner"].update(editor_phases=["p3"], actor_update_interval=1, critic_warmup_steps=0)
+    heads = make_heads(c)
+    assert heads.editor_phases == ["p3"] and "edit_phases" not in heads.state_dict()
+    torch.nn.init.constant_(heads.actor[-1].bias, 1.)
+    z, s, ref = torch.zeros(5, c["token"]["embed_dim"]), torch.zeros(5, c["state_dim"]), torch.randn(5, 30, 32)
+    out = heads.act(z, s, ref, phase=torch.arange(5))
+    act3 = torch.as_tensor(phase_active(c, "p3"))
+    assert torch.equal(out[[0, 1, 3, 4]], ref[[0, 1, 3, 4], :, :18])                 # P1, P2, P4, P5: the reference
+    assert (out[2][:, act3] != ref[2][:, :18][:, act3]).all()                         # P3: edited
+    smooth = heads.smooth_action(ref[..., :18] + 1, ref, torch.zeros(5, 30, 18), phase=torch.arange(5))
+    assert torch.equal(smooth[0], ref[0, :, :18])
+    heads.set_editor_phases(None)
+    assert (heads.act(z, s, ref, phase=torch.arange(5))[0] != ref[0, :, :18])[:, torch.as_tensor(phase_active(c, "p1"))].all()
+    for bad in ([], ["p6"], ["p3", "p3"]):
+        with pytest.raises(ValueError, match="editor_phases"):
+            heads.set_editor_phases(bad)
+    # A batch with only P1 human rows gives the P3-only editor nothing to imitate.
+    learner = Learner(c)
+    n = 4
+    b = dict(token=torch.zeros(n, c["token"]["embed_dim"]), state=torch.zeros(n, c["state_dim"]),
+             reference=torch.zeros(n, 30, 32), action=torch.full((n, 30, 18), .1),
+             valid=torch.ones(n, 30, 18, dtype=torch.bool), human=torch.ones(n, 30, 18, dtype=torch.bool),
+             bc_eligible=torch.ones(n, 30, 18, dtype=torch.bool), reward=torch.zeros(n), discount=torch.zeros(n),
+             td_eligible=torch.zeros(n, dtype=torch.bool), phase=torch.zeros(n, dtype=torch.long), next_phase=torch.zeros(n, dtype=torch.long),
+             scheduler_context=torch.zeros(n, c["scheduler"]["context_dim"]), next_scheduler_context=torch.zeros(n, c["scheduler"]["context_dim"]))
+    b.update(next_token=b["token"], next_state=b["state"], next_reference=b["reference"])
+    m = learner.update(b)
+    assert m["human_bc_elements"] == 0 and m["human_bc_loss"] == 0 and m["grad_norm_bc"] == 0
+    b.update(phase=torch.full((n,), 2), next_phase=torch.full((n,), 2))
+    m = learner.update(b)
+    assert m["human_bc_elements"] == n * 30 * 18 and m["grad_norm_bc"] > 0           # every valid row of P3
+
+
+def test_serving_restricts_a_checkpoint_to_its_editor_phases(tmp_path):
+    from vla_precision.gr00t_rlt import serving
+    from vla_precision.gr00t_rlt.core import sha256
+    c = load_config(CONTINUOUS, "p1", workspace=tmp_path)
+    learner = Path(c["output"]) / "learner"
+    learner.mkdir(parents=True)
+    run = tmp_path / "run"
+    run.mkdir()
+    for name, phases in (("variant-p3.pt", ["p3"]), ("variant-all.pt", None)):
+        torch.save(dict(learner=dict(model=make_heads(c).state_dict()), contract_sha256=c["contract_sha256"],
+                        token_sha256=representation_sha(c), learner_options=dict(editor_phases=phases)), learner / name)
+    policy = serving.LivePolicy.__new__(serving.LivePolicy)
+    policy.c, policy.device, policy.run, policy.token_sha = c, "cpu", run, representation_sha(c)
+    for name, expect in (("variant-p3.pt", ["p3"]), ("variant-all.pt", None), ("variant-p3.pt", ["p3"])):
+        path = learner / name
+        (run / serving.SELECT_FILE).write_text(json.dumps(dict(select="checkpoint", checkpoint=str(path), sha256=sha256(path))))
+        policy._select_actor()
+        assert policy.actor_kind == "editor_rl" and policy.heads.editor_phases == expect
+    (run / serving.SELECT_FILE).write_text(json.dumps(dict(select="base")))
+    policy._select_actor()
+    assert policy.actor_kind == "editor_zero" and policy.heads.editor_phases is None

@@ -103,6 +103,11 @@ class EditorHeads(Heads):
         if self.shared:
             self.actor = mlp(c["token"]["embed_dim"] + c["state_dim"] + self.h*self.full + 5, self.h*self.d)
             self.register_buffer("phase_masks", torch.tensor([phase_active(c, f"p{i+1}") for i in range(5)], dtype=torch.bool))
+            # Phases the editor may edit (learner option, operator 2026-10-20);
+            # elsewhere it serves the reference. Not in the state dict: serving
+            # takes it from the checkpoint's learner_options, like activation.
+            self.register_buffer("edit_phases", torch.ones(5, dtype=torch.bool), persistent=False)
+        self.set_editor_phases(c.get("learner", {}).get("editor_phases"))
         self.scale = float(c["editor"]["residual_scale"])
         # "tanh" (recipe): edit bounded by +/-scale. "linear" (learner option,
         # operator 2026-10-19): scale is only the output gain, the edit is
@@ -134,6 +139,26 @@ class EditorHeads(Heads):
             raise ValueError("Shared editor requires integer phase labels 0..4")
         return self.phase_masks[phase.long()][:, None, :]
 
+    def set_editor_phases(self, phases=None):
+        """None = every phase; else e.g. ["p3"]: the editor edits only there."""
+        if phases is None:
+            self.editor_phases = None
+            if self.shared:
+                self.edit_phases.fill_(True)
+            return
+        if not self.shared:
+            raise ValueError("editor_phases needs the shared full-task editor")
+        names = [f"p{i+1}" for i in range(5)]
+        if not phases or any(p not in names for p in phases) or len(set(phases)) != len(phases):
+            raise ValueError(f"editor_phases must be distinct names from {names}")
+        self.editor_phases = sorted(phases)
+        self.edit_phases.copy_(torch.tensor([n in phases for n in names]))
+
+    def editable(self, phase=None):
+        """Channels the editor may change: active ones, in the editor's phases."""
+        active = self.active_for(phase)
+        return active & self.edit_phases[phase.long()][:, None, None] if self.shared else active
+
     def act(self, z, state, reference, *, dropout=0.0, phase=None):
         if dropout:
             raise ValueError("Editor cannot drop its reference action")
@@ -142,7 +167,7 @@ class EditorHeads(Heads):
         return self._edited(reference[..., :self.d], delta, phase)
 
     def _edited(self, ref, delta, phase):
-        action = ref + torch.where(self.active_for(phase), delta, torch.zeros_like(delta))
+        action = ref + torch.where(self.editable(phase), delta, torch.zeros_like(delta))
         return action.clamp(-ACTION_RANGE, ACTION_RANGE) if self.activation == "linear" else action
 
     def q(self, z, state, reference, action, valid, context=None, *, phase=None):
@@ -265,8 +290,13 @@ class Learner:
                 if self.anchor is not None:
                     with torch.no_grad():
                         anchor = self.anchor.act(z, state, ref, phase=b.get("phase"))
+                # Supervise only what the editor may change (editor_phases), so rows
+                # it cannot edit do not dilute the BC/reference means.
+                supervised = b["valid"]
+                if is_editor(self.c) and self.model.editor_phases is not None:
+                    supervised = supervised & self.model.edit_phases[b["phase"].long()][:, None, None]
                 human_loss, ref_loss, nh, nr = supervised_losses(
-                    pred, b["action"], anchor, b["human"], b["bc_eligible"], b["valid"])
+                    pred, b["action"], anchor, b["human"], b["bc_eligible"], supervised)
                 bc = o["human_bc_weight"] * human_loss + o["reference_weight"] * ref_loss
                 qvalues = self.model.q(z, state, ref, pred, b["valid"], b.get("scheduler_context"), phase=b.get("phase"))[:, 0]
                 qpi = (qvalues * td).sum() / td.sum().clamp(min=1)
@@ -295,7 +325,8 @@ class Learner:
                     weighted_rl_loss=float(-weight * qpi.detach()), q_pi=float(qpi.detach()),
                     q_weight=weight, human_bc_elements=int(nh), reference_elements=int(nr))
                 if is_editor(self.c):
-                    delta = (pred - ref[..., :self.model.d]).detach()[self.model.active_for(b.get("phase")).expand_as(pred)]
+                    delta = (pred - ref[..., :self.model.d]).detach()[self.model.editable(b.get("phase")).expand_as(pred)]
+                    delta = delta if delta.numel() else torch.zeros(1)
                     human_mask = b["human"] & b["bc_eligible"] & b["valid"]
                     outside = (b["action"] - ref[..., :self.model.d]).abs() > self.model.scale
                     metrics.update(editor_delta_mean_abs=float(delta.abs().mean()),

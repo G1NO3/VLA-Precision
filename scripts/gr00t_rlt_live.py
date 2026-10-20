@@ -42,6 +42,10 @@ def main():
     p.add_argument("--editor-activation", choices=("tanh", "linear"), default=None,
                    help="train only: 'linear' removes the editor's tanh bound (residual_scale becomes the output "
                         "gain; edited actions are clamped to +/-2.2). Default: tanh, or the resumed checkpoint's")
+    p.add_argument("--editor-phases", nargs="+", choices=("p1", "p2", "p3", "p4", "p5"), default=None,
+                   help="train only: the editor edits only in these phases and serves the reference elsewhere "
+                        "(e.g. --editor-phases p3; BC/reference losses only there; contract unchanged). Default: all, "
+                        "or the resumed checkpoint's")
     p.add_argument("--reference-anchor", type=Path, default=None,
                    help="train only: an editor checkpoint whose output replaces the frozen pi0.5 reference as the "
                         "reference-loss target (a trust region around e.g. the best round; contract unchanged; "
@@ -55,6 +59,8 @@ def main():
     a = p.parse_args()
     if a.editor_activation is not None and a.command != "train":
         p.error("--editor-activation applies to train only")
+    if a.editor_phases is not None and a.command != "train":
+        p.error("--editor-phases applies to train only")
     if a.human_batch_fraction is not None and (a.command != "train" or not 0 <= a.human_batch_fraction < 1):
         p.error("--human-batch-fraction applies to train only, in [0, 1)")
     if a.reference_anchor is not None and (a.command != "train" or not a.reference_anchor.is_file()):
@@ -243,6 +249,7 @@ def main():
                                                 progress=PROGRESS, keep_static_human=a.keep_static_human,
                                                 human_batch_fraction=a.human_batch_fraction,
                                                 editor_activation=a.editor_activation,
+                                                editor_phases=a.editor_phases,
                                                 reference_anchor=a.reference_anchor))
             finally:
                 audit.close()

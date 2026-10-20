@@ -145,6 +145,7 @@ class LivePolicy:
         ``<run>/live-actor.json`` for the console. Advisory: a failed write
         never stops serving."""
         now = time.time()
+        phases = getattr(getattr(self, "heads", None), "editor_phases", None)
         if changed or not hasattr(self, "_actor_since"):
             self._actor_since = now
             name = (Path(self.actor_path).name if self.actor_kind in ("editor_rl", "rl", "bc", "pi05_head")
@@ -152,14 +153,16 @@ class LivePolicy:
             print(f"[rlt actor] serving {self.actor_kind}: {name} (behavior {self.behavior[:16]}) "
                   + ("at startup" if rollout is None else f"from rollout {rollout}")
                   + ("" if self.selection == "latest" else f" [operator-selected {self.selection}]")
-                  + (" [LINEAR editor: unbounded edit]" if getattr(getattr(self, "heads", None), "activation", "tanh") == "linear" else ""),
+                  + (" [LINEAR editor: unbounded edit]" if getattr(getattr(self, "heads", None), "activation", "tanh") == "linear" else "")
+                  + (f" [edits only in {','.join(phases).upper()}]" if phases else ""),
                   flush=True)
         run = getattr(self, "run", None)
         if run is None:
             return
         record = dict(pid=os.getpid(), kind=self.actor_kind, checkpoint=str(self.actor_path),
                       behavior=self.behavior, loaded=self._actor_since, checked=now, rollout=rollout,
-                      selection=self.selection, editor_activation=getattr(getattr(self, "heads", None), "activation", None))
+                      selection=self.selection, editor_activation=getattr(getattr(self, "heads", None), "activation", None),
+                      editor_phases=phases)
         tmp = run / f"{ACTOR_FILE}.{os.getpid()}.tmp"
         try:
             tmp.write_text(json.dumps(record))
@@ -212,6 +215,8 @@ class LivePolicy:
             if activation not in EDITOR_ACTIVATIONS:
                 raise ValueError(f"Unknown editor activation {activation!r} in {path.name}")
             self.heads.activation = activation
+            # ...and only in the phases it was trained to edit (None = all).
+            self.heads.set_editor_phases((saved.get("learner_options") or {}).get("editor_phases"))
             self.behavior = sha256(path)
             self.actor_path, self.actor_kind = str(path), "editor_rl"
             return
@@ -242,6 +247,7 @@ class LivePolicy:
                 torch.default_generator.manual_seed(self.c["seed"])
                 self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
         self.heads.activation = "tanh"
+        self.heads.set_editor_phases(None)
 
     def _select_head(self, path, digest, saved):
         """A full action head: the frozen policy's head swapped, zero editor."""
