@@ -146,6 +146,7 @@ class LivePolicy:
         never stops serving."""
         now = time.time()
         phases = getattr(getattr(self, "heads", None), "editor_phases", None)
+        mask = getattr(getattr(self, "heads", None), "editor_mask", None)
         if changed or not hasattr(self, "_actor_since"):
             self._actor_since = now
             name = (Path(self.actor_path).name if self.actor_kind in ("editor_rl", "rl", "bc", "pi05_head")
@@ -154,7 +155,9 @@ class LivePolicy:
                   + ("at startup" if rollout is None else f"from rollout {rollout}")
                   + ("" if self.selection == "latest" else f" [operator-selected {self.selection}]")
                   + (" [LINEAR editor: unbounded edit]" if getattr(getattr(self, "heads", None), "activation", "tanh") == "linear" else "")
-                  + (f" [edits only in {','.join(phases).upper()}]" if phases else ""),
+                  + (f" [edits only in {','.join(phases).upper()}]" if phases else "")
+                  + (" [edits only " + "; ".join(f"{p.upper()} {'+'.join(g) or 'nothing'}" for p, g in mask.items()) + "]"
+                     if mask else ""),
                   flush=True)
         run = getattr(self, "run", None)
         if run is None:
@@ -162,7 +165,7 @@ class LivePolicy:
         record = dict(pid=os.getpid(), kind=self.actor_kind, checkpoint=str(self.actor_path),
                       behavior=self.behavior, loaded=self._actor_since, checked=now, rollout=rollout,
                       selection=self.selection, editor_activation=getattr(getattr(self, "heads", None), "activation", None),
-                      editor_phases=phases)
+                      editor_phases=phases, editor_mask=mask)
         tmp = run / f"{ACTOR_FILE}.{os.getpid()}.tmp"
         try:
             tmp.write_text(json.dumps(record))
@@ -217,6 +220,7 @@ class LivePolicy:
             self.heads.activation = activation
             # ...and only in the phases it was trained to edit (None = all).
             self.heads.set_editor_phases((saved.get("learner_options") or {}).get("editor_phases"))
+            self.heads.set_editor_mask((saved.get("learner_options") or {}).get("editor_mask"))
             self.behavior = sha256(path)
             self.actor_path, self.actor_kind = str(path), "editor_rl"
             return
@@ -248,6 +252,7 @@ class LivePolicy:
                 self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
         self.heads.activation = "tanh"
         self.heads.set_editor_phases(None)
+        self.heads.set_editor_mask(None)
 
     def _select_head(self, path, digest, saved):
         """A full action head: the frozen policy's head swapped, zero editor."""

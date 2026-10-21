@@ -46,6 +46,10 @@ def main():
                    help="train only: the editor edits only in these phases and serves the reference elsewhere "
                         "(e.g. --editor-phases p3; BC/reference losses only there; contract unchanged). Default: all, "
                         "or the resumed checkpoint's")
+    p.add_argument("--editor-mask", default=None,
+                   help="train only: per-phase channels the editor may edit, a preset name (moving-arm: P1 right "
+                        "wrist, P2 left, P3 both, P4 left, P5 right, never the hands) or a JSON {phase: [group, ...]}; "
+                        "other channels serve the reference (contract unchanged). Default: all, or the resumed checkpoint's")
     p.add_argument("--reference-anchor", type=Path, default=None,
                    help="train only: an editor checkpoint whose output replaces the frozen pi0.5 reference as the "
                         "reference-loss target (a trust region around e.g. the best round; contract unchanged; "
@@ -61,6 +65,11 @@ def main():
         p.error("--editor-activation applies to train only")
     if a.editor_phases is not None and a.command != "train":
         p.error("--editor-phases applies to train only")
+    if a.editor_mask is not None:
+        if a.command != "train":
+            p.error("--editor-mask applies to train only")
+        if a.editor_mask.lstrip().startswith("{"):
+            a.editor_mask = json.loads(a.editor_mask)
     if a.human_batch_fraction is not None and (a.command != "train" or not 0 <= a.human_batch_fraction < 1):
         p.error("--human-batch-fraction applies to train only, in [0, 1)")
     if a.reference_anchor is not None and (a.command != "train" or not a.reference_anchor.is_file()):
@@ -250,6 +259,7 @@ def main():
                                                 human_batch_fraction=a.human_batch_fraction,
                                                 editor_activation=a.editor_activation,
                                                 editor_phases=a.editor_phases,
+                                                editor_mask=a.editor_mask,
                                                 reference_anchor=a.reference_anchor))
             finally:
                 audit.close()

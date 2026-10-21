@@ -418,3 +418,61 @@ def test_serving_restricts_a_checkpoint_to_its_editor_phases(tmp_path):
     (run / serving.SELECT_FILE).write_text(json.dumps(dict(select="base")))
     policy._select_actor()
     assert policy.actor_kind == "editor_zero" and policy.heads.editor_phases is None
+
+
+def test_moving_arm_mask_edits_only_the_arm_each_phase_moves_and_never_the_hands(tmp_path):
+    from vla_precision.gr00t_rlt.model import EDITOR_GROUPS, resolve_editor_mask
+    c = load_config(CONTINUOUS, "p1", workspace=tmp_path)
+    heads = make_heads(dict(c, learner=dict(c["learner"], editor_mask="moving-arm")))
+    assert heads.editor_mask == resolve_editor_mask("moving-arm") and "edit_channels" not in heads.state_dict()
+    torch.nn.init.constant_(heads.actor[-1].bias, 1.)
+    z, s, ref = torch.zeros(5, c["token"]["embed_dim"]), torch.zeros(5, c["state_dim"]), torch.randn(5, 30, 32)
+    edited = (heads.act(z, s, ref, phase=torch.arange(5)) != ref[..., :18]).all(1)      # (phase, channel)
+    for p, groups in enumerate((["right_wrist"], ["left_wrist"], ["left_wrist", "right_wrist"], ["left_wrist"], ["right_wrist"])):
+        want = torch.zeros(18, dtype=torch.bool)
+        for g in groups:
+            want[list(EDITOR_GROUPS[g])] = True
+        assert torch.equal(edited[p], want & torch.as_tensor(phase_active(c, f"p{p+1}"))), p
+    assert not edited[:, 12:].any()                                                    # no finger or thumb edit
+    heads.set_editor_mask(None)
+    assert (heads.act(z, s, ref, phase=torch.arange(5))[1, :, 12] != ref[1, :, 12]).all()   # P2 thumb editable again
+    for bad in ("nope", {"p6": ["left_wrist"]}, {"p1": ["tail"]}, {"p1": ["left_wrist", "left_wrist"]}):
+        with pytest.raises(ValueError, match="editor_mask"):
+            heads.set_editor_mask(bad)
+    # Training: the masked channels' output units never move; P1's right wrist does.
+    c2 = dict(c, learner=dict(c["learner"], editor_mask="moving-arm", actor_update_interval=1, critic_warmup_steps=0))
+    learner = Learner(c2)
+    n = 4
+    b = dict(token=torch.zeros(n, c["token"]["embed_dim"]), state=torch.zeros(n, c["state_dim"]),
+             reference=torch.zeros(n, 30, 32), action=torch.full((n, 30, 18), .1),
+             valid=torch.as_tensor(phase_active(c, "p1")).expand(n, 30, 18).clone(), human=torch.ones(n, 30, 18, dtype=torch.bool),
+             bc_eligible=torch.ones(n, 30, 18, dtype=torch.bool), reward=torch.ones(n), discount=torch.full((n,), .9),
+             td_eligible=torch.ones(n, dtype=torch.bool), phase=torch.zeros(n, dtype=torch.long), next_phase=torch.zeros(n, dtype=torch.long),
+             scheduler_context=torch.zeros(n, c["scheduler"]["context_dim"]), next_scheduler_context=torch.zeros(n, c["scheduler"]["context_dim"]))
+    b.update(next_token=b["token"], next_state=b["state"], next_reference=b["reference"])
+    for _ in range(3):
+        learner.update(b)
+    bias = learner.model.actor[-1].bias.detach().reshape(30, 18)
+    assert bias[:, 6:12].abs().sum() > 0 and not bias[:, :6].any() and not bias[:, 12:].any()
+
+
+def test_serving_applies_a_checkpoints_editor_mask(tmp_path):
+    from vla_precision.gr00t_rlt import serving
+    from vla_precision.gr00t_rlt.core import sha256
+    from vla_precision.gr00t_rlt.model import resolve_editor_mask
+    c = load_config(CONTINUOUS, "p1", workspace=tmp_path)
+    learner = Path(c["output"]) / "learner"
+    learner.mkdir(parents=True)
+    run = tmp_path / "run"
+    run.mkdir()
+    path = learner / "variant-masked.pt"
+    torch.save(dict(learner=dict(model=make_heads(c).state_dict()), contract_sha256=c["contract_sha256"],
+                    token_sha256=representation_sha(c), learner_options=dict(editor_mask=resolve_editor_mask("moving-arm"))), path)
+    policy = serving.LivePolicy.__new__(serving.LivePolicy)
+    policy.c, policy.device, policy.run, policy.token_sha = c, "cpu", run, representation_sha(c)
+    (run / serving.SELECT_FILE).write_text(json.dumps(dict(select="checkpoint", checkpoint=str(path), sha256=sha256(path))))
+    policy._select_actor()
+    assert policy.heads.editor_mask == resolve_editor_mask("moving-arm")
+    (run / serving.SELECT_FILE).write_text(json.dumps(dict(select="base")))
+    policy._select_actor()
+    assert policy.heads.editor_mask is None

@@ -267,6 +267,9 @@ def fit_heads(c, args):
         asked = getattr(args, "editor_activation", None)
         phases = getattr(args, "editor_phases", None)
         phases = sorted(phases) if phases else None
+        from vla_precision.gr00t_rlt.model import resolve_editor_mask
+        mask = getattr(args, "editor_mask", None)
+        mask = resolve_editor_mask(mask) if mask is not None else None
         if args.resume:
             saved_options = torch.load(args.resume, map_location="cpu", weights_only=True).get("learner_options") or {}
             inherited = saved_options.get("editor_activation", "tanh")
@@ -277,8 +280,15 @@ def fit_heads(c, args):
                 raise ValueError(f"Resume checkpoint edits {saved_options.get('editor_phases') or 'every phase'}; "
                                  f"cannot continue it as {phases}")
             phases = saved_options.get("editor_phases")
+            if mask is not None and mask != saved_options.get("editor_mask"):
+                raise ValueError(f"Resume checkpoint edits {saved_options.get('editor_mask') or 'every active channel'}; "
+                                 f"cannot continue it as {mask}")
+            mask = saved_options.get("editor_mask")
         c["learner"]["editor_activation"] = asked or "tanh"
         c["learner"]["editor_phases"] = phases      # None = every phase (post-hash; contract unchanged)
+        # None = every active channel; else the resolved {phase: groups}, so the
+        # checkpoint says exactly what it edits (post-hash; contract unchanged).
+        c["learner"]["editor_mask"] = mask
     learner = Learner(c, args.device)
     if args.resume:
         previous = torch.load(args.resume, map_location=args.device, weights_only=True)

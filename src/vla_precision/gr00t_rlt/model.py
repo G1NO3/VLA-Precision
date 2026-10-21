@@ -107,7 +107,11 @@ class EditorHeads(Heads):
             # elsewhere it serves the reference. Not in the state dict: serving
             # takes it from the checkpoint's learner_options, like activation.
             self.register_buffer("edit_phases", torch.ones(5, dtype=torch.bool), persistent=False)
+            # Channels the editor may edit per phase (learner option editor_mask,
+            # operator 2026-10-21), same handling as edit_phases.
+            self.register_buffer("edit_channels", torch.ones(5, self.d, dtype=torch.bool), persistent=False)
         self.set_editor_phases(c.get("learner", {}).get("editor_phases"))
+        self.set_editor_mask(c.get("learner", {}).get("editor_mask"))
         self.scale = float(c["editor"]["residual_scale"])
         # "tanh" (recipe): edit bounded by +/-scale. "linear" (learner option,
         # operator 2026-10-19): scale is only the output gain, the edit is
@@ -154,10 +158,33 @@ class EditorHeads(Heads):
         self.editor_phases = sorted(phases)
         self.edit_phases.copy_(torch.tensor([n in phases for n in names]))
 
+    def set_editor_mask(self, mask=None):
+        """None = every active channel; a preset name (EDITOR_MASK_PRESETS) or
+        {phase: [group, ...]} from EDITOR_GROUPS: the editor edits only those
+        channels in that phase, none in a phase it does not name."""
+        if mask is None:
+            self.editor_mask = None
+            if self.shared:
+                self.edit_channels.fill_(True)
+            return
+        if not self.shared:
+            raise ValueError("editor_mask needs the shared full-task editor")
+        resolved = resolve_editor_mask(mask)
+        rows = torch.zeros(5, self.d, dtype=torch.bool)
+        for phase, groups in resolved.items():
+            for group in groups:
+                rows[int(phase[1]) - 1, list(EDITOR_GROUPS[group])] = True
+        self.editor_mask = resolved
+        self.edit_channels.copy_(rows)
+
     def editable(self, phase=None):
-        """Channels the editor may change: active ones, in the editor's phases."""
+        """Channels the editor may change: active ones, in the editor's phases
+        and its per-phase channel mask."""
         active = self.active_for(phase)
-        return active & self.edit_phases[phase.long()][:, None, None] if self.shared else active
+        if not self.shared:
+            return active
+        p = phase.long()
+        return active & self.edit_phases[p][:, None, None] & self.edit_channels[p][:, None, :]
 
     def act(self, z, state, reference, *, dropout=0.0, phase=None):
         if dropout:
@@ -180,6 +207,29 @@ class EditorHeads(Heads):
         if self.activation == "tanh":
             delta = delta.clamp(-self.scale, self.scale)
         return self._edited(ref, delta, phase)
+
+
+#: actor channels (18 normalized action dims) by body part
+EDITOR_GROUPS = {"left_wrist": range(0, 6), "right_wrist": range(6, 12), "left_thumb": range(12, 13),
+                 "right_fingers": range(13, 18)}
+#: "moving-arm" (operator 2026-10-21): only the arm that moves and that the
+#: operator corrects in each phase; both arms in P3 (insertion); never the hands.
+EDITOR_MASK_PRESETS = {"moving-arm": {"p1": ["right_wrist"], "p2": ["left_wrist"], "p3": ["left_wrist", "right_wrist"],
+                                      "p4": ["left_wrist"], "p5": ["right_wrist"]}}
+
+
+def resolve_editor_mask(mask):
+    """A preset name or {phase: [group, ...]} -> a validated {phase: sorted groups}."""
+    if isinstance(mask, str):
+        if mask not in EDITOR_MASK_PRESETS:
+            raise ValueError(f"editor_mask preset must be one of {sorted(EDITOR_MASK_PRESETS)}")
+        mask = EDITOR_MASK_PRESETS[mask]
+    names = [f"p{i+1}" for i in range(5)]
+    if not isinstance(mask, dict) or any(p not in names for p in mask) or any(
+            not isinstance(g, (list, tuple)) or any(x not in EDITOR_GROUPS for x in g) or len(set(g)) != len(g)
+            for g in mask.values()):
+        raise ValueError(f"editor_mask must map phases {names} to groups from {sorted(EDITOR_GROUPS)}")
+    return {p: sorted(mask[p]) for p in sorted(mask)}
 
 
 EDITOR_ACTIVATIONS = ("tanh", "linear")
