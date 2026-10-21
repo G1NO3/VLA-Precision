@@ -19,6 +19,7 @@
 !/tests/test_continuous_editor.py
 !/tests/test_v6d_editor.py
 !/tests/test_pi05_head.py
+!/tests/test_xattn_editor.py
 .ruff_cache/
 __pycache__/
 *.py[cod]

@@ -46,6 +46,10 @@ def main():
                    help="train only: the editor edits only in these phases and serves the reference elsewhere "
                         "(e.g. --editor-phases p3; BC/reference losses only there; contract unchanged). Default: all, "
                         "or the resumed checkpoint's")
+    p.add_argument("--editor-arch", choices=("mlp", "xattn"), default=None,
+                   help="train only: 'xattn' = cross-attention editor over the 512 visual prefix tokens (the "
+                        "observation captures are cached once under <output>/visual-tokens); default mlp over the "
+                        "2x2-pooled feature, or the resumed checkpoint's (contract unchanged)")
     p.add_argument("--editor-mask", default=None,
                    help="train only: per-phase channels the editor may edit, a preset name (moving-arm: P1 right "
                         "wrist, P2 left, P3 both, P4 left, P5 right, never the hands) or a JSON {phase: [group, ...]}; "
@@ -65,6 +69,8 @@ def main():
         p.error("--editor-activation applies to train only")
     if a.editor_phases is not None and a.command != "train":
         p.error("--editor-phases applies to train only")
+    if a.editor_arch is not None and a.command != "train":
+        p.error("--editor-arch applies to train only")
     if a.editor_mask is not None:
         if a.command != "train":
             p.error("--editor-mask applies to train only")
@@ -260,6 +266,7 @@ def main():
                                                 editor_activation=a.editor_activation,
                                                 editor_phases=a.editor_phases,
                                                 editor_mask=a.editor_mask,
+                                                editor_arch=a.editor_arch, run=a.run,
                                                 reference_anchor=a.reference_anchor))
             finally:
                 audit.close()

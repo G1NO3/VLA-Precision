@@ -10,7 +10,7 @@ import torch
 
 from .core import check_code, sha256, validate_assets, is_focus, is_editor, representation_sha, is_shared, phase_active, is_wrist_velocity
 from .features import frozen_features
-from .model import EDITOR_ACTIVATIONS, Heads, token_model, make_heads, spatial_features
+from .model import EDITOR_ACTIVATIONS, EDITOR_ARCHS, Heads, token_model, make_heads, spatial_features, visual_tokens
 
 
 def check_live_weights(config, run=None):
@@ -208,8 +208,17 @@ class LivePolicy:
             self._apply_head()
             if saved["contract_sha256"] != self.c["contract_sha256"] or saved["token_sha256"] != self.token_sha:
                 raise ValueError("Editor actor/representation contract mismatch")
-            if not hasattr(self, "heads"):
-                self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
+            options = saved.get("learner_options") or {}
+            arch = options.get("editor_arch") or "mlp"
+            if arch not in EDITOR_ARCHS:
+                raise ValueError(f"Unknown editor architecture {arch!r} in {path.name}")
+            if not hasattr(self, "heads") or getattr(self.heads, "arch", "mlp") != arch \
+                    or getattr(self, "_xattn", None) != options.get("editor_xattn"):
+                # The network the checkpoint was trained as (MLP or cross-attention).
+                self.heads = make_heads(dict(self.c, learner=dict(self.c["learner"], editor_arch=arch,
+                                                                  editor_xattn=options.get("editor_xattn")))
+                                        ).to(self.device).eval().requires_grad_(False)
+                self._xattn = options.get("editor_xattn")
             self.heads.load_state_dict(saved["learner"]["model"])
             if any(not torch.isfinite(v).all() for v in self.heads.state_dict().values()):
                 raise ValueError("Non-finite editor weights")
@@ -244,12 +253,15 @@ class LivePolicy:
         self.actor_path, self.actor_kind = str(path), kind
 
     def _zero_editor(self):
-        if not hasattr(self, "heads") or getattr(self, "actor_kind", None) not in ("editor_zero", "pi05_head"):
+        if (not hasattr(self, "heads") or getattr(self, "actor_kind", None) not in ("editor_zero", "pi05_head")
+                or getattr(self.heads, "arch", "mlp") != "mlp"):
             # Fresh zero residual (a selected base must not keep served RL weights).
             # Local seed scope: no effect on the frozen flow sampler RNG.
             with torch.random.fork_rng(devices=[]):
                 torch.default_generator.manual_seed(self.c["seed"])
-                self.heads = make_heads(self.c).to(self.device).eval().requires_grad_(False)
+                self.heads = make_heads(dict(self.c, learner=dict(self.c["learner"], editor_arch="mlp"))
+                                        ).to(self.device).eval().requires_grad_(False)
+                self._xattn = None
         self.heads.activation = "tanh"
         self.heads.set_editor_phases(None)
         self.heads.set_editor_mask(None)
@@ -342,6 +354,8 @@ class LivePolicy:
                     torch.as_tensor(f["mask"], device=self.device))[None]
             z = spatial_features(prefix, mask) if is_editor(self.c) else self.token.encode_flat(prefix, mask)
             phase_args = {"phase": torch.tensor([int(phase[1])-1], device=self.device)} if is_shared(self.c) else {}
+            if getattr(self.heads, "arch", "mlp") == "xattn":
+                phase_args["vis"] = visual_tokens(prefix, mask)   # the same served tokens the replay captures
             action = self.heads.act(z, torch.as_tensor(f["state"], device=self.device)[None],
                                torch.as_tensor(f["reference"], device=self.device)[None], **phase_args)[0].cpu().numpy()
         acted = time.perf_counter()

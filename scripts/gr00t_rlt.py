@@ -20,6 +20,7 @@ from vla_precision.gr00t_rlt.core import is_editor, is_async_editor, representat
 from vla_precision.gr00t_rlt.core import STATIC_HUMAN, drop_static_human
 
 HUMAN_BATCH_FRACTION = .5
+XATTN_DEFAULTS = dict(width=256, layers=2, heads=4)   # cross-attention editor (model.CrossAttentionActor)
 
 
 def write_json(path, value):
@@ -227,6 +228,30 @@ def sample_batch(rng, n, batch_size, phase_rows, human_rows, n_human):
     return ids
 
 
+def _visual_tokens(c, args, data):
+    """Cache the replay's visual tokens and check them against its pooled feature."""
+    import torch
+    from vla_precision.gr00t_rlt import visual_cache
+    from vla_precision.gr00t_rlt.model import spatial_features
+    if "observation_file" not in data:
+        raise ValueError("Cross-attention editor needs a snapshot with observation_file (export a new one)")
+    run = Path(getattr(args, "run", None) or Path(args.replay).resolve().parents[1])
+    cache = Path(getattr(args, "visual_cache", None) or visual_cache.default_cache(c))
+    report = lambda n, total: print(json.dumps(dict(visual_tokens_cached=n, of=total)), flush=True)
+    have, added = visual_cache.build(run, [*data["observation_file"], *data["next_observation_file"]], cache,
+                                     c["contract_sha256"], report=report)
+    print(json.dumps(dict(visual_cache=str(cache), cached=have, added=added)), flush=True)
+    loader = visual_cache.Loader(cache, data["observation_file"], data["next_observation_file"])
+    probe = np.linspace(0, len(data["token"]) - 1, min(32, len(data["token"]))).astype(int)
+    vis, _ = loader._read(probe)
+    prefix = torch.zeros(len(probe), 768, 2048)
+    prefix[:, :512] = torch.as_tensor(vis).float()
+    pooled = spatial_features(prefix, torch.arange(768)[None].expand(len(probe), -1) < 512).numpy()
+    if not np.allclose(pooled, data["token"][probe], atol=1e-4):
+        raise ValueError("Cached visual tokens do not pool to the replay's editor feature: wrong observation files")
+    return loader
+
+
 def fit_heads(c, args):
     import torch
     from vla_precision.gr00t_rlt.model import Learner
@@ -289,6 +314,19 @@ def fit_heads(c, args):
         # None = every active channel; else the resolved {phase: groups}, so the
         # checkpoint says exactly what it edits (post-hash; contract unchanged).
         c["learner"]["editor_mask"] = mask
+        # Actor architecture (post-hash): "mlp" over the 2x2-pooled feature, or
+        # "xattn" over the 512 visual tokens. A resumed run keeps its own.
+        arch = getattr(args, "editor_arch", None)
+        if args.resume:
+            inherited = saved_options.get("editor_arch") or "mlp"
+            if arch is not None and arch != inherited:
+                raise ValueError(f"Resume checkpoint is a {inherited} editor; cannot continue it as {arch}")
+            arch = inherited
+        c["learner"]["editor_arch"] = arch or "mlp"
+        if c["learner"]["editor_arch"] == "xattn":
+            # Recorded so serving rebuilds the same network.
+            c["learner"]["editor_xattn"] = dict(XATTN_DEFAULTS, **(saved_options.get("editor_xattn") or {})) \
+                if args.resume else dict(XATTN_DEFAULTS)
     learner = Learner(c, args.device)
     if args.resume:
         previous = torch.load(args.resume, map_location=args.device, weights_only=True)
@@ -319,6 +357,9 @@ def fit_heads(c, args):
         kind = (saved.get("learner_options") or {}).get("editor_activation", "tanh")
         if kind != c["learner"]["editor_activation"]:
             raise ValueError(f"Reference anchor is a {kind} editor; this run is {c['learner']['editor_activation']}")
+        kind = (saved.get("learner_options") or {}).get("editor_arch") or "mlp"
+        if kind != c["learner"]["editor_arch"]:
+            raise ValueError(f"Reference anchor is a {kind} editor; this run is {c['learner']['editor_arch']}")
         learner.set_anchor(saved["learner"]["model"])
         c["learner"]["reference_anchor"] = dict(checkpoint=str(anchor), sha256=sha256(anchor), step=saved["learner"]["step"])
         print(json.dumps(dict(reference_anchor=c["learner"]["reference_anchor"])), flush=True)
@@ -358,21 +399,34 @@ def fit_heads(c, args):
     n_human = int(round(quota * batch_size)) if human_rows else 0
     if quota and not human_rows:
         print("[learner] human batch quota skipped: no human BC windows", flush=True)
+    vis_loader = None
+    if is_editor(c) and c["learner"]["editor_arch"] == "xattn":
+        vis_loader = _visual_tokens(c, args, data)
     if progress:
         progress.stage("train", updates_done=0, updates_total=updates, batch_size=batch_size,
                        dataset_transitions=len(r), samples_seen=0, start_step=learner.step,
                        reference_weight=c["learner"]["reference_weight"],
                        human_bc_weight=c["learner"]["human_bc_weight"])
+    draw = lambda: sample_batch(rng, len(r), batch_size, phase_rows if is_shared(c) else None, human_rows, n_human)
+    ids = draw()
+    pending = vis_loader.submit(ids) if vis_loader else None
     for done in range(1, updates + 1):
         if getattr(args, "replay_check", None):
             args.replay_check()
-        ids = sample_batch(rng, len(r), batch_size, phase_rows if is_shared(c) else None, human_rows, n_human)
-        batch = {k: torch.as_tensor(data[k][ids], device=args.device,
+        current = ids
+        batch = {k: torch.as_tensor(data[k][current], device=args.device,
                                    dtype=torch.bool if data[k].dtype == np.bool_ else torch.float32) for k in keys}
+        if vis_loader:
+            vis, next_vis = pending.result()
+            batch.update(vis=torch.as_tensor(vis, device=args.device), next_vis=torch.as_tensor(next_vis, device=args.device))
+        if done < updates:
+            # Same numpy draws in the same order as before; only the token read runs ahead.
+            ids = draw()
+            pending = vis_loader.submit(ids) if vis_loader else None
         metrics = learner.update(batch)
         if is_shared(c):
-            metrics["phase_samples"] = {f"p{i+1}": int((data["phase"][ids] == i).sum()) for i in range(5)}
-        metrics["human_windows"] = int(has_human[ids].sum())
+            metrics["phase_samples"] = {f"p{i+1}": int((data["phase"][current] == i).sum()) for i in range(5)}
+        metrics["human_windows"] = int(has_human[current].sum())
         with (out / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(metrics, allow_nan=False) + "\n")
         if learner.step % 10 == 0:

@@ -43,7 +43,7 @@ class Heads(nn.Module):
         qdim = state_dim + self.h * (self.full - self.d) + 2 * self.h * self.d
         self.critics = nn.ModuleList([mlp(qdim, 1), mlp(qdim, 1)])
 
-    def act(self, z, state, reference, *, dropout=0.0, phase=None):
+    def act(self, z, state, reference, *, dropout=0.0, phase=None, vis=None):
         ref = reference
         if dropout:
             ref = ref * (torch.rand((len(ref), 1, 1), device=ref.device) >= dropout)
@@ -186,7 +186,9 @@ class EditorHeads(Heads):
         p = phase.long()
         return active & self.edit_phases[p][:, None, None] & self.edit_channels[p][:, None, :]
 
-    def act(self, z, state, reference, *, dropout=0.0, phase=None):
+    arch = "mlp"
+
+    def act(self, z, state, reference, *, dropout=0.0, phase=None, vis=None):
         if dropout:
             raise ValueError("Editor cannot drop its reference action")
         out = self.actor(torch.cat([self._phase_features(phase, z), state, reference.flatten(1)], -1))
@@ -232,12 +234,98 @@ def resolve_editor_mask(mask):
     return {p: sorted(mask[p]) for p in sorted(mask)}
 
 
+VISUAL_TOKENS = 512   # ego 16x16 + FOCUS 16x16 SigLIP tokens of the PI05 prefix (spatial_features layout)
+
+
+def visual_tokens(prefix, mask):
+    """The two real views' final-layer prefix tokens, (B, 512, 2048), as the
+    pooled feature sees them (same layout checks as spatial_features)."""
+    if (prefix.ndim != 3 or prefix.shape[-1] != 2048 or prefix.shape[1] < 768
+            or mask.shape != prefix.shape[:2] or mask.dtype != torch.bool):
+        raise ValueError("Unexpected PI05 image-prefix layout")
+    if not mask[:, :VISUAL_TOKENS].all() or mask[:, VISUAL_TOKENS:768].any():
+        raise ValueError("Editor requires two real views and a masked third view")
+    return prefix[:, :VISUAL_TOKENS]
+
+
+class CrossAttentionActor(nn.Module):
+    """One query per action row attends to the 512 frozen visual tokens.
+
+    Queries: a learned row embedding + the row's reference action + (state,
+    phase). Pre-LN decoder blocks: self-attention across rows, cross-attention
+    to the projected tokens (+ learned position per token), MLP. The output
+    layer is zero-initialized like the MLP editor's (``self[-1]``)."""
+    def __init__(self, vis_dim, cond_dim, ref_dim, rows, out_dim, *, width=256, layers=2, heads=4):
+        super().__init__()
+        self.vis = nn.Sequential(nn.LayerNorm(vis_dim), nn.Linear(vis_dim, width))
+        self.vis_pos = nn.Parameter(torch.randn(VISUAL_TOKENS, width) * .02)
+        self.rows = nn.Parameter(torch.randn(rows, width) * .02)
+        self.ref = nn.Linear(ref_dim, width)
+        self.cond = nn.Sequential(nn.LayerNorm(cond_dim), nn.Linear(cond_dim, width))
+        self.blocks = nn.ModuleList([nn.TransformerDecoderLayer(width, heads, 4 * width, dropout=0., activation="gelu",
+                                                                batch_first=True, norm_first=True) for _ in range(layers)])
+        self.norm = nn.LayerNorm(width)
+        self.out = nn.Linear(width, out_dim)
+
+    def __getitem__(self, index):
+        if index != -1:
+            raise IndexError("CrossAttentionActor exposes only its output layer as [-1]")
+        return self.out
+
+    def forward(self, vis, cond, reference):
+        memory = self.vis(vis.float()) + self.vis_pos
+        query = self.rows + self.ref(reference) + self.cond(cond)[:, None]
+        for block in self.blocks:
+            query = block(query, memory)
+        return self.out(self.norm(query))
+
+
+class XAttnEditorHeads(EditorHeads):
+    """The direct editor with a cross-attention actor (learner option
+    editor_arch="xattn", operator 2026-10-21): the actor reads the 512 visual
+    tokens instead of their 2x2-pooled 16384 feature, so fine positions (tip vs
+    hole) are not averaged away. Same bounded residual, phases, channel mask,
+    held channels and twin critic (which keeps the pooled feature) as the MLP."""
+    arch = "xattn"
+
+    def __init__(self, c):
+        super().__init__(c)
+        x = c.get("learner", {}).get("editor_xattn") or {}
+        self.actor = CrossAttentionActor(c["token"]["input_dim"], c["state_dim"] + self.phase_dim, self.full, self.h,
+                                         self.d, width=int(x.get("width", 256)), layers=int(x.get("layers", 2)),
+                                         heads=int(x.get("heads", 4)))
+        nn.init.zeros_(self.actor[-1].weight)
+        nn.init.zeros_(self.actor[-1].bias)
+
+    def act(self, z, state, reference, *, dropout=0.0, phase=None, vis=None):
+        if dropout:
+            raise ValueError("Editor cannot drop its reference action")
+        if vis is None or vis.ndim != 3 or vis.shape[1:] != (VISUAL_TOKENS, self.actor.vis[0].normalized_shape[0]) \
+                or len(vis) != len(state):
+            raise ValueError("Cross-attention editor needs the (B, 512, 2048) visual prefix tokens")
+        cond = state if not self.shared else torch.cat(
+            [state, torch.nn.functional.one_hot(self._phase(phase), 5).to(state)], -1)
+        out = self.actor(vis, cond, reference)
+        delta = self.scale * (out if self.activation == "linear" else out.tanh())
+        return self._edited(reference[..., :self.d], delta, phase)
+
+    def _phase(self, phase):
+        self.active_for(phase)  # validate
+        return phase.long()
+
+
+EDITOR_ARCHS = ("mlp", "xattn")
 EDITOR_ACTIVATIONS = ("tanh", "linear")
 ACTION_RANGE = 2.2   # normalized action clamp (Heads.smooth_action)
 
 
 def make_heads(c):
-    return EditorHeads(c) if is_editor(c) else Heads(c)
+    if not is_editor(c):
+        return Heads(c)
+    arch = c.get("learner", {}).get("editor_arch") or "mlp"
+    if arch not in EDITOR_ARCHS:
+        raise ValueError(f"editor_arch must be one of {EDITOR_ARCHS}")
+    return XAttnEditorHeads(c) if arch == "xattn" else EditorHeads(c)
 
 
 def supervised_losses(prediction, action, reference, human, eligible, valid):
@@ -307,7 +395,8 @@ class Learner:
         self.step += 1
         z, state, ref = b["token"], b["state"], b["reference"]
         with torch.no_grad():
-            nxt = self.target.act(b["next_token"], b["next_state"], b["next_reference"], phase=b.get("next_phase"))
+            nxt = self.target.act(b["next_token"], b["next_state"], b["next_reference"], phase=b.get("next_phase"),
+                                  vis=b.get("next_vis"))
             noise = (torch.randn_like(nxt) * o["target_noise"]).clamp(-o["target_noise_clip"], o["target_noise_clip"])
             nv = torch.ones_like(b["valid"]) & self.model.active_for(b.get("next_phase"))
             smoothed = self.target.smooth_action(nxt, b["next_reference"], noise, phase=b.get("next_phase"))
@@ -335,11 +424,11 @@ class Learner:
         if self.step % o["actor_update_interval"] == 0:
             self.model.critics.requires_grad_(False)
             try:
-                pred = self.model.act(z, state, ref, dropout=o["reference_dropout"], phase=b.get("phase"))
+                pred = self.model.act(z, state, ref, dropout=o["reference_dropout"], phase=b.get("phase"), vis=b.get("vis"))
                 anchor = ref
                 if self.anchor is not None:
                     with torch.no_grad():
-                        anchor = self.anchor.act(z, state, ref, phase=b.get("phase"))
+                        anchor = self.anchor.act(z, state, ref, phase=b.get("phase"), vis=b.get("vis"))
                 # Supervise only what the editor may change (editor_phases), so rows
                 # it cannot edit do not dilute the BC/reference means.
                 supervised = b["valid"]
